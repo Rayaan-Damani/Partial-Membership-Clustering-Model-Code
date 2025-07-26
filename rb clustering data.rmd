@@ -1,0 +1,2686 @@
+```{r}
+
+# First, let's carefully analyze the structure of the data
+# Read the raw data to examine format
+raw_data <- readLines("RB all data.csv", n = 10)  # Read first 10 lines
+print("First few lines of raw data:")
+print(raw_data)
+
+# Try reading with different settings
+rb_data_no_header <- read.csv("RB all data.csv", header = FALSE)
+print("Dimensions with no header:")
+print(dim(rb_data_no_header))
+print("First few column names with no header:")
+print(head(colnames(rb_data_no_header), 10))
+
+# Skip the first line (which might be a title or merged header)
+rb_data_skip1 <- read.csv("RB all data.csv", skip = 1)
+print("Dimensions when skipping first line:")
+print(dim(rb_data_skip1))
+print("First few column names when skipping first line:")
+print(head(colnames(rb_data_skip1), 10))
+
+# If that works, save the correct data
+rb_data <- rb_data_skip1
+
+# Print all column names to find the ones we need
+print("All column names:")
+print(colnames(rb_data))
+
+# Identify the key statistics columns based on the correlation matrix
+# Now with exact column name matching
+print("Searching for rushing yards after contact column:")
+after_contact_cols <- grep("after.*contact|aftercontact", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[after_contact_cols])
+
+print("Searching for yards before contact column:")
+before_contact_cols <- grep("before.*contact|beforecontact", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[before_contact_cols])
+
+print("Searching for broken tackles column:")
+broken_tackle_cols <- grep("brk.*tkl|broken.*tackle", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[broken_tackle_cols])
+
+print("Searching for success rate column:")
+success_cols <- grep("succ", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[success_cols])
+
+print("Searching for receiving targets column:")
+target_cols <- grep("target", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[target_cols])
+
+print("Searching for receiving YAC column:")
+rec_yac_cols <- grep("rec.*yac|rec.*after", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[rec_yac_cols])
+
+print("Searching for receiving broken tackles column:")
+rec_broken_tackle_cols <- grep("rec.*brk|rec.*broken", colnames(rb_data), ignore.case = TRUE)
+print(colnames(rb_data)[rec_broken_tackle_cols])
+
+# Create an index of key columns we'll use
+key_columns <- list(
+  player = grep("^Player$", colnames(rb_data), ignore.case = TRUE),
+  season = grep("^Season$", colnames(rb_data), ignore.case = TRUE),
+  team = grep("^Team$", colnames(rb_data), ignore.case = TRUE),
+  rush_yds = grep("RushYds$", colnames(rb_data), ignore.case = TRUE),
+  y_after_contact = after_contact_cols,
+  y_before_contact = before_contact_cols,
+  broken_tackles = broken_tackle_cols,
+  success_rate = success_cols,
+  rec_targets = target_cols,
+  rec_yac = rec_yac_cols,
+  rec_broken_tackles = rec_broken_tackle_cols
+)
+
+print("Identified key columns:")
+for (name in names(key_columns)) {
+  if (length(key_columns[[name]]) > 0) {
+    print(paste(name, "=", paste(colnames(rb_data)[key_columns[[name]]], collapse=", ")))
+  } else {
+    print(paste(name, "= NOT FOUND"))
+  }
+}
+
+# Extract only the columns we need
+final_columns <- unlist(key_columns)
+final_columns <- final_columns[!is.na(final_columns) & final_columns > 0]
+final_columns <- unique(final_columns)
+
+# Print what we found
+print("Final columns for analysis:")
+print(colnames(rb_data)[final_columns])
+
+# Check for duplicated column names (which can cause issues)
+dup_cols <- duplicated(colnames(rb_data))
+if (any(dup_cols)) {
+  print("Warning: Duplicated column names found:")
+  print(colnames(rb_data)[dup_cols])
+}
+
+# Extract only the needed data and handle missing values
+rb_clean <- rb_data[, final_columns]
+# Replace NA values with 0
+rb_clean[is.na(rb_clean)] <- 0
+
+# Scale the numeric data (excluding player, season, team info)
+# Identify which columns are numeric (excluding player, season, team)
+info_cols <- c(
+  key_columns$player, 
+  key_columns$season, 
+  key_columns$team
+)
+
+numeric_cols <- sapply(rb_clean, is.numeric)
+cols_to_scale <- which(numeric_cols & !(1:ncol(rb_clean) %in% info_cols))
+
+# Scale the data
+rb_scaled <- rb_clean
+rb_scaled[, cols_to_scale] <- scale(rb_clean[, cols_to_scale])
+
+# Now rb_scaled contains the prepared data for our analysis
+print("Data successfully prepared for analysis")
+print(paste("Dimensions of prepared data:", paste(dim(rb_scaled), collapse="x")))
+print("First few rows of prepared data:")
+if (nrow(rb_scaled) > 0) {
+  print(head(rb_scaled, 3))
+} else {
+  print("No data available after cleaning")
+}
+```
+
+```{r}
+# Running Back Similarity Analysis using Product Partition Model
+# Base R implementation - no dplyr dependencies
+
+# Install and load required packages
+if (!require("cluster")) install.packages("cluster")
+if (!require("ggplot2")) install.packages("ggplot2")
+
+library(cluster)    # For clustering utilities
+library(ggplot2)    # For visualization
+
+# Read the RB data (properly skipping the first row which is category headers)
+rb_data <- read.csv("RB all data.csv", skip = 1, header = TRUE)
+
+# Print the column names so we can verify
+print("Column names in the dataset:")
+print(colnames(rb_data))
+
+# Identify key metrics based on the correlation matrix
+key_metrics <- c(
+  "yards.after.contact",    # YAfterContact_Rush
+  "Yaftercontact.Att",      # YAfterContact_Rush (alternative)
+  "Yards.before.contact",   # YBeforeContact_Rush
+  "YbeforeContact.Att",     # YBeforeContact_Rush (alternative)
+  "RushingBrkTkl",          # BrokenTackles_Rush
+  "Succ.",                  # SuccessRate
+  "Succ..1",                # SuccessRate (alternative)
+  "RecBrkTkl",              # RecBrokenTackles
+  "AvgDepthOTarget",        # RecTargets
+  "Yaftercatch"             # RecYAC
+)
+
+# Create a clean dataset with only the columns we need using base R
+# First identify indices of the columns we want
+player_col <- which(colnames(rb_data) == "Player")
+season_col <- which(colnames(rb_data) == "Season")
+team_col <- which(colnames(rb_data) == "Team")
+rushyds_col <- which(colnames(rb_data) == "RushYds")
+
+# Identify which of our key metrics exist in the data
+metric_cols <- numeric()
+for (metric in key_metrics) {
+  col_idx <- which(colnames(rb_data) == metric)
+  if (length(col_idx) > 0) {
+    metric_cols <- c(metric_cols, col_idx)
+  }
+}
+
+# Print what we found
+print("Found key columns:")
+print(colnames(rb_data)[c(player_col, season_col, team_col, rushyds_col, metric_cols)])
+
+# Create the clean dataset with only these columns
+cols_to_keep <- c(player_col, season_col, team_col, rushyds_col, metric_cols)
+rb_clean <- rb_data[, cols_to_keep]
+
+# Replace missing values with 0
+rb_clean[is.na(rb_clean)] <- 0
+
+# Scale the metrics for better comparability (excluding player info columns)
+info_cols <- c(1, 2, 3, 4) # Player, Season, Team, RushYds
+metric_indices <- 5:ncol(rb_clean) # all other columns are metrics
+
+# Create a scaled version
+rb_scaled <- rb_clean
+rb_scaled[, metric_indices] <- scale(rb_clean[, metric_indices])
+
+# Define the similarity function for continuous covariates
+# Following the approach in the paper
+similarity_continuous <- function(x_values, m = 0, v = 1) {
+  n <- length(x_values)
+  if (n == 1) return(1) # Single value case
+  
+  # Calculate similarity based on normal distribution as in the paper
+  s <- exp(-0.5 * sum((x_values - m)^2) / v)
+  return(s)
+}
+
+# Define cohesion function based on PPM with DP prior
+# c(Sj) = M * (|Sj| - 1)!
+cohesion <- function(cluster_size, M = 1) {
+  if (cluster_size <= 0) return(0)
+  if (cluster_size == 1) return(M)
+  return(M * factorial(cluster_size - 1))
+}
+
+# MCMC implementation for the PPMx model
+ppmx_rb_clustering <- function(data, metric_indices, n_iter = 1000, M = 1) {
+  n <- nrow(data)
+  # Initialize with all players in their own cluster
+  clusters <- 1:n
+  n_clusters <- n
+  
+  # Create a matrix to store cluster assignments for each iteration
+  cluster_history <- matrix(0, nrow = n_iter, ncol = n)
+  
+  # Prepare data matrix of metrics
+  X <- as.matrix(data[, metric_indices])
+  
+  # Main MCMC loop
+  for (iter in 1:n_iter) {
+    # For each player
+    for (i in 1:n) {
+      # Remove player i from its current cluster
+      current_cluster <- clusters[i]
+      clusters[i] <- 0  # Temporarily set to 0
+      
+      # If the cluster becomes empty, reduce the cluster count
+      if (!any(clusters == current_cluster)) {
+        # Relabel clusters to maintain consecutive numbers
+        for (j in 1:n) {
+          if (clusters[j] > current_cluster) {
+            clusters[j] <- clusters[j] - 1
+          }
+        }
+        n_clusters <- n_clusters - 1
+      }
+      
+      # Calculate probabilities for joining each existing cluster or creating a new one
+      probs <- numeric(n_clusters + 1)
+      
+      # For each existing cluster
+      for (k in 1:n_clusters) {
+        # Get indices of players in cluster k
+        cluster_indices <- which(clusters == k)
+        
+        # Calculate similarity based on metrics
+        similarity_prod <- 1
+        for (m in 1:ncol(X)) {
+          cluster_values <- X[cluster_indices, m]
+          player_value <- X[i, m]
+          # Add a small constant to variance to avoid problems with single-element clusters
+          v_value <- var(c(cluster_values, player_value)) + 0.1
+          similarity_prod <- similarity_prod * 
+            similarity_continuous(c(cluster_values, player_value),
+                                 m = mean(c(cluster_values, player_value)),
+                                 v = v_value)
+        }
+        
+        # Calculate cohesion
+        c_value <- cohesion(length(cluster_indices) + 1, M)
+        
+        # Final probability
+        probs[k] <- c_value * similarity_prod
+      }
+      
+      # Probability of creating a new cluster
+      probs[n_clusters + 1] <- cohesion(1, M)  # M for new cluster
+      
+      # Normalize probabilities
+      probs <- probs / sum(probs)
+      
+      # Sample new cluster assignment
+      new_cluster <- sample(1:(n_clusters + 1), 1, prob = probs)
+      
+      # If creating a new cluster
+      if (new_cluster > n_clusters) {
+        n_clusters <- n_clusters + 1
+      }
+      
+      # Assign player to the new cluster
+      clusters[i] <- new_cluster
+    }
+    
+    # Save cluster assignments for this iteration
+    cluster_history[iter, ] <- clusters
+  }
+  
+  # Return cluster assignments from the last iteration
+  return(list(
+    final_clusters = clusters,
+    n_clusters = n_clusters,
+    cluster_history = cluster_history
+  ))
+}
+
+# Calculate similarity matrix from cluster co-occurrence
+calculate_similarity <- function(cluster_history, burn_in = 100) {
+  n <- ncol(cluster_history)
+  n_iter <- nrow(cluster_history)
+  
+  # Skip burn-in period
+  if (burn_in < n_iter) {
+    cluster_history <- cluster_history[(burn_in+1):n_iter, ]
+    n_iter <- nrow(cluster_history) 
+  }
+  
+  # Initialize similarity matrix
+  similarity_matrix <- matrix(0, nrow = n, ncol = n)
+  
+  # For each iteration after burn-in
+  for (iter in 1:n_iter) {
+    clusters <- cluster_history[iter, ]
+    
+    # For each pair of players
+    for (i in 1:n) {
+      for (j in 1:n) {
+        # If in same cluster, increment similarity counter
+        if (clusters[i] == clusters[j]) {
+          similarity_matrix[i, j] <- similarity_matrix[i, j] + 1
+        }
+      }
+    }
+  }
+  
+  # Convert to probabilities
+  similarity_matrix <- similarity_matrix / n_iter
+  
+  return(similarity_matrix)
+}
+
+# Find similar players for a specific RB
+find_similar_players <- function(player_name, similarity_matrix, data, top_n = 5) {
+  # Find player index
+  player_idx <- which(data[, 1] == player_name)  # Assuming Player is the first column
+  
+  if (length(player_idx) == 0) {
+    return("Player not found")
+  }
+  
+  # Get similarity scores for this player
+  sim_scores <- similarity_matrix[player_idx, ]
+  
+  # Create data frame with player names and similarity scores
+  similarity_df <- data.frame(
+    Player = data[, 1],
+    Season = data[, 2],
+    Team = data[, 3],
+    Similarity = sim_scores
+  )
+  
+  # Return top N most similar players (excluding the player itself)
+  # First filter out the player itself
+  filtered_df <- similarity_df[similarity_df$Player != player_name | 
+                                 similarity_df$Season != data[player_idx, 2], ]
+  
+  # Sort by similarity (descending)
+  sorted_idx <- order(filtered_df$Similarity, decreasing = TRUE)
+  
+  # Return top N
+  result <- filtered_df[sorted_idx[1:min(top_n, nrow(filtered_df))], ]
+  
+  return(result)
+}
+
+# Find hidden gems - players with high similarity to stars but lower rushing yards
+find_hidden_gems <- function(similarity_matrix, data, rushing_threshold = 1000, top_n = 10) {
+  # Identify star RBs (those with high rushing yards)
+  # Assuming RushYds is column 4
+  star_rbs_idx <- which(data[, 4] > rushing_threshold)
+  
+  # Calculate average similarity to star RBs for each player
+  n <- nrow(data)
+  avg_similarity <- numeric(n)
+  
+  for (i in 1:n) {
+    if (i %in% star_rbs_idx) {
+      # Skip star RBs themselves
+      avg_similarity[i] <- 0
+    } else {
+      # Average similarity to all star RBs
+      avg_similarity[i] <- mean(similarity_matrix[i, star_rbs_idx])
+    }
+  }
+  
+  # Create data frame with player info and similarity scores
+  hidden_gems_df <- data.frame(
+    Player = data[, 1],
+    Season = data[, 2],
+    Team = data[, 3],
+    RushYds = data[, 4],
+    Similarity_to_Stars = avg_similarity
+  )
+  
+  # Filter out players above the threshold
+  filtered_df <- hidden_gems_df[hidden_gems_df$RushYds <= rushing_threshold, ]
+  
+  # Sort by similarity (descending)
+  sorted_idx <- order(filtered_df$Similarity_to_Stars, decreasing = TRUE)
+  
+  # Return top N
+  result <- filtered_df[sorted_idx[1:min(top_n, nrow(filtered_df))], ]
+  
+  return(result)
+}
+
+# Visualize the clusters using PCA
+visualize_clusters <- function(data, clusters, metric_indices) {
+  # Add cluster information to the data
+  data_with_clusters <- data
+  data_with_clusters$Cluster <- as.factor(clusters)
+  
+  # Create a PCA plot for visualization using the specified metrics
+  pca_data <- prcomp(data[, metric_indices], scale. = TRUE)
+  
+  pca_df <- data.frame(
+    PC1 = pca_data$x[,1],
+    PC2 = pca_data$x[,2],
+    Player = data[, 1],
+    Season = data[, 2],
+    Cluster = data_with_clusters$Cluster
+  )
+  
+  # Generate the plot
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+    geom_point() +
+    geom_text(aes(label = Player), vjust = -1, size = 3, check_overlap = TRUE) +
+    theme_minimal() +
+    labs(title = "Running Back Clusters", x = "PC1", y = "PC2") +
+    theme(legend.position = "right")
+  
+  return(p)
+}
+
+# Visualize hidden gems
+visualize_hidden_gems <- function(hidden_gems_df) {
+  p <- ggplot(hidden_gems_df, aes(x = RushYds, y = Similarity_to_Stars)) +
+    geom_point() +
+    geom_text(aes(label = paste(Player, Season)), vjust = -1, size = 3) +
+    theme_minimal() +
+    labs(title = "Hidden Gem Running Backs",
+         x = "Rushing Yards",
+         y = "Similarity to Star RBs") +
+    theme(legend.position = "none")
+  
+  return(p)
+}
+
+# Print metrics we're using
+print("Metrics included in analysis:")
+print(colnames(rb_clean)[metric_indices])
+
+# Run the PPMx model
+set.seed(123) # For reproducibility
+print("Running clustering algorithm...")
+ppmx_results <- ppmx_rb_clustering(
+  data = rb_scaled,
+  metric_indices = metric_indices,
+  n_iter = 500,  # Number of MCMC iterations
+  M = 1          # Prior parameter
+)
+print("Clustering complete.")
+
+# Calculate RB similarity matrix
+print("Calculating player similarities...")
+rb_similarity <- calculate_similarity(ppmx_results$cluster_history, burn_in = 100)
+
+# Generate outputs
+# Find players similar to a star RB (choose one known to be in the dataset)
+star_rb <- "Christian McCaffrey"  # You can change this to any player in the dataset
+print(paste("Finding players most similar to", star_rb))
+similar_to_star <- find_similar_players(star_rb, rb_similarity, rb_clean)
+
+# Find hidden gems
+print("Finding hidden gem running backs...")
+hidden_gems <- find_hidden_gems(rb_similarity, rb_clean, rushing_threshold = 1000)
+
+# Visualizations
+print("Generating visualizations...")
+cluster_plot <- visualize_clusters(rb_scaled, ppmx_results$final_clusters, metric_indices)
+hidden_gems_plot <- visualize_hidden_gems(hidden_gems)
+
+# Print results
+print("Final number of clusters:")
+print(ppmx_results$n_clusters)
+
+print(paste("Players most similar to", star_rb, ":"))
+print(similar_to_star)
+
+print("Hidden gem running backs:")
+print(hidden_gems)
+
+# Display plots
+print("Displaying plots...")
+grid.arrange(cluster_plot, hidden_gems_plot, ncol = 1)
+
+# If grid.arrange doesn't work, try plotting individually
+if (!exists("grid.arrange")) {
+  print(cluster_plot)
+  print(hidden_gems_plot)
+}
+
+```
+
+
+```{r}
+# Running Back Similarity Analysis using Product Partition Model
+# Fixed version for error handling
+
+# Install and load required packages
+if (!require("cluster")) install.packages("cluster")
+if (!require("ggplot2")) install.packages("ggplot2")
+
+library(cluster)    # For clustering utilities
+library(ggplot2)    # For visualization
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Read the RB data (properly skipping the first row which is category headers)
+rb_data <- read.csv("RB all data.csv", skip = 1, header = TRUE)
+
+print("Dataset loaded with dimensions:")
+print(dim(rb_data))
+
+# First identify indices of the columns we want
+player_col <- which(colnames(rb_data) == "Player")
+season_col <- which(colnames(rb_data) == "Season")
+team_col <- which(colnames(rb_data) == "Team")
+rushyds_col <- which(colnames(rb_data) == "RushYds")
+
+# Identify metrics related to the correlation matrix
+yards_after_contact_col <- which(colnames(rb_data) == "yards.after.contact")
+yac_per_att_col <- which(colnames(rb_data) == "Yaftercontact.Att")
+yards_before_contact_col <- which(colnames(rb_data) == "Yards.before.contact")
+ybc_per_att_col <- which(colnames(rb_data) == "YbeforeContact.Att")
+rush_brk_tkl_col <- which(colnames(rb_data) == "RushingBrkTkl")
+succ_rate_col <- which(colnames(rb_data) == "Succ.")
+rec_brk_tkl_col <- which(colnames(rb_data) == "RecBrkTkl")
+depth_target_col <- which(colnames(rb_data) == "AvgDepthOTarget")
+
+# Combine all metric columns
+metric_cols <- c(
+  yards_after_contact_col, 
+  yac_per_att_col, 
+  yards_before_contact_col, 
+  ybc_per_att_col, 
+  rush_brk_tkl_col, 
+  succ_rate_col, 
+  rec_brk_tkl_col, 
+  depth_target_col
+)
+
+# Remove any NA values (columns that weren't found)
+metric_cols <- metric_cols[!is.na(metric_cols)]
+
+# Print what we found
+print("Found key columns:")
+print(colnames(rb_data)[c(player_col, season_col, team_col, rushyds_col, metric_cols)])
+
+# Create the clean dataset with only these columns
+cols_to_keep <- c(player_col, season_col, team_col, rushyds_col, metric_cols)
+rb_clean <- rb_data[, cols_to_keep]
+
+# Replace missing values with 0
+rb_clean[is.na(rb_clean)] <- 0
+
+# Scale the metrics for better comparability (excluding player info columns)
+info_cols <- c(1, 2, 3, 4) # Player, Season, Team, RushYds
+metric_indices <- 5:ncol(rb_clean) # all other columns are metrics
+
+# Create a scaled version
+rb_scaled <- rb_clean
+if (length(metric_indices) > 0) {
+  rb_scaled[, metric_indices] <- scale(rb_clean[, metric_indices])
+}
+
+print("Data prepared for analysis")
+
+# Use hierarchical clustering for speed
+print("Running hierarchical clustering...")
+# Create distance matrix based on the scaled metrics
+if (length(metric_indices) > 0) {
+  # Calculate Euclidean distance between all players based on their metrics
+  dist_matrix <- dist(rb_scaled[, metric_indices])
+  
+  # Perform hierarchical clustering
+  hc <- hclust(dist_matrix, method = "ward.D2")
+  
+  # Cut the tree to get a reasonable number of clusters
+  n_clusters <- min(15, nrow(rb_scaled)) # Choose a sensible number
+  clusters <- cutree(hc, k = n_clusters)
+  
+  print(paste("Clustering complete with", n_clusters, "clusters"))
+} else {
+  stop("No metric columns found for clustering")
+}
+
+# Find similar players for a specific RB
+find_similar_players <- function(player_name, clusters, data, top_n = 5) {
+  # Find player index
+  player_idx <- which(data[, 1] == player_name)  # Assuming Player is the first column
+  
+  if (length(player_idx) == 0) {
+    return(data.frame(message = "Player not found"))
+  }
+  
+  # Get the cluster of the player of interest
+  player_cluster <- clusters[player_idx]
+  
+  # Find all players in the same cluster
+  cluster_members <- which(clusters == player_cluster)
+  
+  # Create data frame with player info
+  same_cluster_df <- data.frame(
+    Player = data[cluster_members, 1],
+    Season = data[cluster_members, 2],
+    Team = data[cluster_members, 3],
+    RushYds = data[cluster_members, 4],
+    Similarity = 1.0 # Set to 1.0 for all cluster members (simplification)
+  )
+  
+  # Filter out the player itself
+  filtered_df <- same_cluster_df[
+    same_cluster_df$Player != player_name | 
+    same_cluster_df$Season != data[player_idx, 2], 
+  ]
+  
+  # Return top N
+  if (nrow(filtered_df) > top_n) {
+    result <- filtered_df[1:top_n, ]
+  } else {
+    result <- filtered_df
+  }
+  
+  return(result)
+}
+
+# Find hidden gems - players with high similarity to stars but lower rushing yards
+find_hidden_gems <- function(clusters, data, rushing_threshold = 1000, top_n = 10) {
+  # Identify star RBs (those with high rushing yards)
+  star_rbs_idx <- which(data[, 4] > rushing_threshold)
+  
+  if (length(star_rbs_idx) == 0) {
+    print("No star RBs found with rushing yards above the threshold")
+    return(data.frame())
+  }
+  
+  # Get the clusters of star RBs
+  star_clusters <- unique(clusters[star_rbs_idx])
+  
+  # Find players in the same clusters as stars but with fewer rushing yards
+  hidden_gems_list <- list()
+  for (cluster in star_clusters) {
+    # Find all players in this cluster
+    cluster_members <- which(clusters == cluster)
+    
+    # Filter to those with less than threshold rushing yards
+    gems_idx <- cluster_members[data[cluster_members, 4] <= rushing_threshold]
+    
+    if (length(gems_idx) > 0) {
+      # Create data frame for this cluster's gems
+      gems_df <- data.frame(
+        Player = data[gems_idx, 1],
+        Season = data[gems_idx, 2],
+        Team = data[gems_idx, 3],
+        RushYds = data[gems_idx, 4],
+        Star_Cluster = cluster
+      )
+      
+      hidden_gems_list[[length(hidden_gems_list) + 1]] <- gems_df
+    }
+  }
+  
+  # Combine all hidden gems
+  if (length(hidden_gems_list) > 0) {
+    all_gems <- do.call(rbind, hidden_gems_list)
+    
+    # Sort by rushing yards (descending) as a simple proxy for potential
+    sorted_gems <- all_gems[order(all_gems$RushYds, decreasing = TRUE), ]
+    
+    # Return top N
+    if (nrow(sorted_gems) > top_n) {
+      result <- sorted_gems[1:top_n, ]
+    } else {
+      result <- sorted_gems
+    }
+    
+    return(result)
+  } else {
+    return(data.frame())
+  }
+}
+
+# Visualize the clusters using PCA
+visualize_clusters <- function(data, clusters, metric_indices) {
+  # Add cluster information to the data
+  data_with_clusters <- data
+  data_with_clusters$Cluster <- as.factor(clusters)
+  
+  # Create a PCA plot for visualization using the specified metrics
+  if (length(metric_indices) > 0) {
+    pca_data <- prcomp(data[, metric_indices], scale. = TRUE)
+    
+    pca_df <- data.frame(
+      PC1 = pca_data$x[,1],
+      PC2 = pca_data$x[,2],
+      Player = data[, 1],
+      Season = data[, 2],
+      Cluster = data_with_clusters$Cluster
+    )
+    
+    # Generate the plot
+    p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+      geom_point() +
+      geom_text(aes(label = Player), vjust = -1, size = 3, check_overlap = TRUE) +
+      theme_minimal() +
+      labs(title = "Running Back Clusters", x = "PC1", y = "PC2") +
+      theme(legend.position = "right")
+    
+    return(p)
+  } else {
+    return(NULL)
+  }
+}
+
+# Visualize hidden gems
+visualize_hidden_gems <- function(hidden_gems_df) {
+  if (nrow(hidden_gems_df) == 0) {
+    return(NULL)
+  }
+  
+  p <- ggplot(hidden_gems_df, aes(x = RushYds, y = as.factor(Star_Cluster))) +
+    geom_point() +
+    geom_text(aes(label = paste(Player, Season)), hjust = -0.2, size = 3) +
+    theme_minimal() +
+    labs(title = "Hidden Gem Running Backs",
+         x = "Rushing Yards",
+         y = "Star RB Cluster") +
+    theme(legend.position = "none")
+  
+  return(p)
+}
+
+# Generate outputs
+# Find players similar to a star RB (choose one known to be in the dataset)
+star_rb <- "Christian McCaffrey"  # You can change this to any player in the dataset
+print(paste("Finding players most similar to", star_rb))
+similar_to_star <- find_similar_players(star_rb, clusters, rb_clean)
+
+# Find hidden gems
+print("Finding hidden gem running backs...")
+hidden_gems <- find_hidden_gems(clusters, rb_clean, rushing_threshold = 1000)
+
+# Visualizations
+print("Generating visualizations...")
+if (length(metric_indices) > 0) {
+  cluster_plot <- visualize_clusters(rb_scaled, clusters, metric_indices)
+} else {
+  cluster_plot <- NULL
+}
+hidden_gems_plot <- visualize_hidden_gems(hidden_gems)
+
+# Print results
+print("Final number of clusters:")
+print(length(unique(clusters)))
+
+print(paste("Players most similar to", star_rb, ":"))
+print(similar_to_star)
+
+print("Hidden gem running backs:")
+print(hidden_gems)
+
+# Write results to CSV files for easier viewing
+write.csv(similar_to_star, "similar_players.csv", row.names = FALSE)
+write.csv(hidden_gems, "hidden_gems.csv", row.names = FALSE)
+print("Results saved to CSV files")
+
+# Display plots
+if (!is.null(cluster_plot)) {
+  print(cluster_plot)
+  # Save plot to file
+  ggsave("cluster_plot.png", cluster_plot, width = 10, height = 8)
+  print("Cluster plot saved to 'cluster_plot.png'")
+}
+
+if (!is.null(hidden_gems_plot)) {
+  print(hidden_gems_plot)
+  # Save plot to file
+  ggsave("hidden_gems_plot.png", hidden_gems_plot, width = 10, height = 8)
+  print("Hidden gems plot saved to 'hidden_gems_plot.png'")
+}
+
+print("Analysis complete!")
+```
+
+
+```{r}
+# Running Back Similarity Analysis using Product Partition Model with Regression on Covariates
+# Fixed implementation based on Müller, Quintana, and Rosner's paper
+
+# Install and load required packages
+required_packages <- c("MCMCpack", "mvtnorm", "ggplot2", "reshape2", "gridExtra")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Read the cleaned RB data
+rb_data <- read.csv("RB all data.csv", header = TRUE)
+
+# Print dataset dimensions and first few rows
+print(paste("Dataset loaded with dimensions:", paste(dim(rb_data), collapse="x")))
+print("First few rows:")
+print(head(rb_data, 3))
+
+# Identify key metrics based on the correlation matrix in your original image
+key_metrics <- c(
+  "yards after contact",      # scaled_YAfterContact_Rush
+  "Yaftercontact/Att",        # scaled_YAfterContact_Rush (per attempt)
+  "Yards before contact",     # scaled_YBeforeContact_Rush
+  "YbeforeContact/Att",       # scaled_YBeforeContact_Rush (per attempt)
+  "RushingBrkTkl",            # scaled_BrokenTackles_Rush
+  "Rush Succ%",               # scaled_SuccessRate
+  "RecBrkTkl",                # scaled_RecBrokenTackles_Per
+  "AvgDepthOTarget"           # scaled_RecTargets
+)
+
+# Map to actual column names in the dataset
+print("Available columns:")
+print(colnames(rb_data))
+
+actual_metrics <- c()
+for (metric in key_metrics) {
+  # Find columns that contain the metric name (case insensitive)
+  matches <- grep(metric, colnames(rb_data), ignore.case = TRUE)
+  if (length(matches) > 0) {
+    actual_metrics <- c(actual_metrics, colnames(rb_data)[matches[1]])
+    print(paste("Found metric:", colnames(rb_data)[matches[1]]))
+  }
+}
+
+print("Metrics used in the analysis:")
+print(actual_metrics)
+
+# Preprocess data: handle missing values and scale
+# Select columns we need
+selected_cols <- c("Player", "Season", "Team", "RushYds")
+for (col in actual_metrics) {
+  if (col %in% colnames(rb_data)) {
+    selected_cols <- c(selected_cols, col)
+  }
+}
+
+rb_selected <- rb_data[, selected_cols, drop = FALSE]
+
+# Replace NA values with 0
+for (col in colnames(rb_selected)) {
+  rb_selected[is.na(rb_selected[, col]), col] <- 0
+}
+
+# Scale the metrics
+metric_indices <- which(colnames(rb_selected) %in% actual_metrics)
+rb_scaled <- rb_selected
+if (length(metric_indices) > 0) {
+  rb_scaled[, metric_indices] <- scale(rb_selected[, metric_indices])
+}
+
+# Define similarity function for continuous covariates (Section 4 in the paper)
+# The paper uses a normal distribution with moments (mj, vj)
+similarity_continuous <- function(x_values, m = 0, v = 1) {
+  n <- length(x_values)
+  if (n <= 1) return(1) # Single value case
+  
+  # Calculate similarity based on normal distribution as in the paper
+  # Add a small constant to variance to avoid problems
+  if (is.na(v) || v <= 0.01) v <- 0.01
+  
+  # Density of multivariate normal (up to a constant)
+  s <- exp(-0.5 * sum((x_values - m)^2) / v)
+  return(s)
+}
+
+# Define cohesion function based on PPM with DP prior
+# c(Sj) = M * (|Sj| - 1)! as in the paper
+cohesion <- function(cluster_size, M = 1) {
+  if (cluster_size <= 0) return(0)
+  if (cluster_size == 1) return(M)
+  # Use log factorial for large clusters to avoid overflow
+  if (cluster_size > 20) {
+    return(M * exp(lfactorial(cluster_size - 1)))
+  }
+  return(M * factorial(cluster_size - 1))
+}
+
+# Implement the PPMx model with MCMC for posterior inference (Section 3 in the paper)
+ppmx_rb_clustering <- function(data, metric_indices, n_iter = 2000, burn_in = 500, M = 1) {
+  n <- nrow(data)
+  
+  # Initialize with all players in their own cluster
+  clusters <- 1:n
+  n_clusters <- n
+  
+  # Create matrices to store cluster assignments and other information
+  cluster_history <- matrix(0, nrow = n_iter, ncol = n)
+  n_clusters_history <- numeric(n_iter)
+  
+  # Prepare data matrix of metrics
+  X <- as.matrix(data[, metric_indices])
+  
+  # Main MCMC loop
+  for (iter in 1:n_iter) {
+    # For each player
+    for (i in 1:n) {
+      # Remove player i from its current cluster
+      current_cluster <- clusters[i]
+      clusters[i] <- 0  # Temporarily set to 0
+      
+      # If the cluster becomes empty, reduce the cluster count
+      if (!any(clusters == current_cluster)) {
+        # Relabel clusters to maintain consecutive numbers
+        for (j in 1:n) {
+          if (clusters[j] > current_cluster) {
+            clusters[j] <- clusters[j] - 1
+          }
+        }
+        n_clusters <- n_clusters - 1
+      }
+      
+      # Calculate probabilities for joining each existing cluster or creating a new one
+      probs <- numeric(n_clusters + 1)
+      
+      # For each existing cluster
+      for (k in 1:n_clusters) {
+        # Get indices of players in cluster k
+        cluster_indices <- which(clusters == k)
+        
+        # Skip if no players in this cluster (shouldn't happen but just in case)
+        if (length(cluster_indices) == 0) {
+          probs[k] <- 0
+          next
+        }
+        
+        # Calculate similarity based on metrics (product of individual similarity functions)
+        similarity_prod <- 1
+        for (m in 1:ncol(X)) {
+          cluster_values <- X[cluster_indices, m]
+          player_value <- X[i, m]
+          
+          # Skip if all values are NA
+          if (all(is.na(c(cluster_values, player_value)))) {
+            next
+          }
+          
+          # Replace NAs with mean
+          cluster_values[is.na(cluster_values)] <- mean(cluster_values, na.rm = TRUE)
+          if (is.na(player_value)) {
+            player_value <- mean(cluster_values, na.rm = TRUE)
+          }
+          
+          # Calculate cluster mean and variance (with small constant to avoid division by zero)
+          cluster_mean <- mean(c(cluster_values, player_value), na.rm = TRUE)
+          cluster_var <- var(c(cluster_values, player_value), na.rm = TRUE)
+          if (is.na(cluster_var) || cluster_var < 0.01) {
+            cluster_var <- 0.01
+          }
+          
+          # Apply similarity function from the paper
+          sim_val <- similarity_continuous(c(cluster_values, player_value), 
+                                        m = cluster_mean,
+                                        v = cluster_var)
+          
+          # Ensure similarity is valid
+          if (!is.na(sim_val) && sim_val > 0) {
+            similarity_prod <- similarity_prod * sim_val
+          }
+        }
+        
+        # Calculate cohesion as per the paper
+        c_value <- cohesion(length(cluster_indices) + 1, M)
+        
+        # Final probability from the paper: cohesion * similarity
+        probs[k] <- c_value * similarity_prod
+      }
+      
+      # Probability of creating a new cluster
+      probs[n_clusters + 1] <- cohesion(1, M)  # M for new cluster
+      
+      # Normalize probabilities and handle edge cases
+      probs[is.na(probs)] <- 0
+      probs[probs < 0] <- 0
+      
+      # If all probabilities are 0, use uniform probabilities
+      if (sum(probs) == 0) {
+        probs <- rep(1, n_clusters + 1)
+      }
+      
+      # Normalize to sum to 1
+      probs <- probs / sum(probs)
+      
+      # Check for NAs or non-finite values
+      if (any(is.na(probs)) || any(!is.finite(probs))) {
+        # If any problems, use uniform distribution
+        probs <- rep(1, n_clusters + 1)
+        probs <- probs / sum(probs)
+      }
+      
+      # Sample new cluster assignment
+      new_cluster <- sample(1:(n_clusters + 1), 1, prob = probs)
+      
+      # If creating a new cluster
+      if (new_cluster > n_clusters) {
+        n_clusters <- n_clusters + 1
+      }
+      
+      # Assign player to the new cluster
+      clusters[i] <- new_cluster
+    }
+    
+    # Save cluster assignments for this iteration
+    cluster_history[iter, ] <- clusters
+    n_clusters_history[iter] <- n_clusters
+    
+    # Print progress
+    if (iter %% 100 == 0) {
+      print(paste("Iteration", iter, "completed. Current number of clusters:", n_clusters))
+    }
+  }
+  
+  # Return results
+  return(list(
+    final_clusters = clusters,
+    n_clusters = n_clusters,
+    cluster_history = cluster_history,
+    n_clusters_history = n_clusters_history,
+    burn_in = burn_in
+  ))
+}
+
+# Calculate posterior similarity matrix from MCMC output
+# This follows Section 3.3 of the paper on posterior inference on clusters
+calculate_similarity <- function(cluster_history, burn_in = 500) {
+  n <- ncol(cluster_history)
+  n_iter <- nrow(cluster_history)
+  
+  # Skip burn-in period
+  if (burn_in < n_iter) {
+    cluster_history <- cluster_history[(burn_in+1):n_iter, ]
+    n_iter <- nrow(cluster_history) 
+  }
+  
+  # Initialize similarity matrix
+  similarity_matrix <- matrix(0, nrow = n, ncol = n)
+  
+  # For each iteration after burn-in
+  for (iter in 1:n_iter) {
+    clusters <- cluster_history[iter, ]
+    
+    # For each pair of players
+    for (i in 1:n) {
+      for (j in 1:n) {
+        # If in same cluster, increment similarity counter
+        if (clusters[i] == clusters[j]) {
+          similarity_matrix[i, j] <- similarity_matrix[i, j] + 1
+        }
+      }
+    }
+  }
+  
+  # Convert to posterior probabilities of co-clustering
+  similarity_matrix <- similarity_matrix / n_iter
+  
+  return(similarity_matrix)
+}
+
+# Find similar players for a specific RB (Section 3.2 - Predictive Inference)
+find_similar_players <- function(player_name, similarity_matrix, data, top_n = 5) {
+  # Find player index
+  player_idx <- which(data$Player == player_name)
+  
+  if (length(player_idx) == 0) {
+    return(data.frame(message = "Player not found"))
+  }
+  
+  # If multiple seasons, choose the most recent
+  if (length(player_idx) > 1) {
+    player_idx <- player_idx[which.max(data$Season[player_idx])]
+  }
+  
+  # Get similarity scores for this player (posterior probability of co-clustering)
+  sim_scores <- similarity_matrix[player_idx, ]
+  
+  # Create data frame with player names and similarity scores
+  similarity_df <- data.frame(
+    Player = data$Player,
+    Season = data$Season,
+    Team = data$Team,
+    RushYds = data$RushYds,
+    Similarity = sim_scores
+  )
+  
+  # Filter out the player itself
+  filtered_df <- similarity_df[
+    similarity_df$Player != player_name | 
+    similarity_df$Season != data$Season[player_idx], 
+  ]
+  
+  # Sort by similarity (descending)
+  sorted_df <- filtered_df[order(filtered_df$Similarity, decreasing = TRUE), ]
+  
+  # Return top N
+  if (nrow(sorted_df) > top_n) {
+    result <- sorted_df[1:top_n, ]
+  } else {
+    result <- sorted_df
+  }
+  
+  return(result)
+}
+
+# Find hidden gems (players with high similarity to stars but lower rushing yards)
+find_hidden_gems <- function(similarity_matrix, data, rushing_threshold = 1000, top_n = 10) {
+  # Identify star RBs (those with high rushing yards)
+  star_rbs_idx <- which(data$RushYds > rushing_threshold)
+  
+  if (length(star_rbs_idx) == 0) {
+    print("No star RBs found with rushing yards above the threshold")
+    return(data.frame())
+  }
+  
+  # Calculate average similarity to star RBs for each player
+  n <- nrow(data)
+  avg_similarity <- numeric(n)
+  
+  for (i in 1:n) {
+    if (i %in% star_rbs_idx) {
+      # Skip star RBs themselves
+      avg_similarity[i] <- 0
+    } else {
+      # Average similarity to all star RBs (posterior probability of co-clustering)
+      avg_similarity[i] <- mean(similarity_matrix[i, star_rbs_idx])
+    }
+  }
+  
+  # Create data frame with player info and similarity scores
+  hidden_gems_df <- data.frame(
+    Player = data$Player,
+    Season = data$Season,
+    Team = data$Team,
+    RushYds = data$RushYds,
+    Similarity_to_Stars = avg_similarity
+  )
+  
+  # Filter out players above the threshold
+  filtered_df <- hidden_gems_df[hidden_gems_df$RushYds <= rushing_threshold, ]
+  
+  # Sort by similarity (descending)
+  sorted_df <- filtered_df[order(filtered_df$Similarity_to_Stars, decreasing = TRUE), ]
+  
+  # Return top N
+  if (nrow(sorted_df) > top_n) {
+    result <- sorted_df[1:top_n, ]
+  } else {
+    result <- sorted_df
+  }
+  
+  return(result)
+}
+
+# Visualize the clusters using PCA
+visualize_clusters <- function(data, clusters, metric_indices) {
+  # Add cluster information to the data
+  data_with_clusters <- data
+  data_with_clusters$Cluster <- as.factor(clusters)
+  
+  # Create a PCA plot for visualization using the specified metrics
+  pca_data <- prcomp(data[, metric_indices], scale. = TRUE)
+  
+  # Create dataframe for plotting
+  pca_df <- data.frame(
+    PC1 = pca_data$x[,1],
+    PC2 = pca_data$x[,2],
+    Player = data$Player,
+    Season = data$Season,
+    RushYds = data$RushYds,
+    Cluster = data_with_clusters$Cluster
+  )
+  
+  # Generate the plot
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster)) +
+    geom_point(aes(size = RushYds), alpha = 0.7) +
+    scale_size_continuous(range = c(1, 5)) +
+    geom_text(aes(label = Player), vjust = -1, size = 3, check_overlap = TRUE) +
+    theme_minimal() +
+    labs(title = "Running Back Clusters", 
+         x = "PC1", 
+         y = "PC2",
+         size = "Rushing Yards") +
+    theme(legend.position = "right")
+  
+  return(p)
+}
+
+# Visualize hidden gems with their similarity to star RBs
+visualize_hidden_gems <- function(hidden_gems_df) {
+  if (nrow(hidden_gems_df) == 0) {
+    return(NULL)
+  }
+  
+  p <- ggplot(hidden_gems_df, aes(x = RushYds, y = Similarity_to_Stars)) +
+    geom_point(aes(size = Similarity_to_Stars), alpha = 0.7) +
+    geom_text(aes(label = paste(Player, Season)), hjust = -0.2, size = 3) +
+    theme_minimal() +
+    labs(title = "Hidden Gem Running Backs",
+         x = "Rushing Yards",
+         y = "Similarity to Star RBs",
+         size = "Similarity Score") +
+    theme(legend.position = "right")
+  
+  return(p)
+}
+
+# Visualize convergence of MCMC
+visualize_convergence <- function(n_clusters_history, burn_in) {
+  iterations <- 1:length(n_clusters_history)
+  conv_df <- data.frame(
+    Iteration = iterations,
+    NumClusters = n_clusters_history,
+    Phase = ifelse(iterations <= burn_in, "Burn-in", "Sampling")
+  )
+  
+  p <- ggplot(conv_df, aes(x = Iteration, y = NumClusters, color = Phase)) +
+    geom_line() +
+    geom_vline(xintercept = burn_in, linetype = "dashed") +
+    theme_minimal() +
+    labs(title = "MCMC Convergence - Number of Clusters",
+         x = "Iteration",
+         y = "Number of Clusters") +
+    scale_color_manual(values = c("Burn-in" = "gray", "Sampling" = "blue"))
+  
+  return(p)
+}
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Run the PPMx model
+print("Running PPMx clustering algorithm (MCMC)...")
+# Use fewer iterations for testing, increase for better results
+n_iter <- 1000    # Total number of MCMC iterations (increased from original)
+burn_in <- 250    # Burn-in period
+M <- 1            # DP concentration parameter
+
+# Run the MCMC
+ppmx_results <- ppmx_rb_clustering(
+  data = rb_scaled,
+  metric_indices = metric_indices,
+  n_iter = n_iter,
+  burn_in = burn_in,
+  M = M
+)
+
+print("MCMC complete. Calculating posterior distributions...")
+
+# Calculate posterior similarity matrix
+rb_similarity <- calculate_similarity(ppmx_results$cluster_history, burn_in)
+
+# Generate outputs
+# Find players similar to example star RBs
+star_rbs <- c("Christian McCaffrey", "Derrick Henry", "Saquon Barkley")
+similar_players_list <- list()
+
+for (star_rb in star_rbs) {
+  print(paste("Finding players most similar to", star_rb))
+  tryCatch({
+    similar_to_star <- find_similar_players(star_rb, rb_similarity, rb_selected)
+    similar_players_list[[star_rb]] <- similar_to_star
+    print(similar_to_star)
+  }, error = function(e) {
+    print(paste("Error finding players similar to", star_rb, ":", e$message))
+  })
+}
+
+# Find hidden gems
+print("Finding hidden gem running backs...")
+hidden_gems <- find_hidden_gems(rb_similarity, rb_selected, rushing_threshold = 1000)
+print(hidden_gems)
+
+# Visualizations
+print("Generating visualizations...")
+# 1. PCA plot of final clusters
+cluster_plot <- visualize_clusters(rb_scaled, ppmx_results$final_clusters, metric_indices)
+
+# 2. Hidden gems plot
+hidden_gems_plot <- visualize_hidden_gems(hidden_gems)
+
+# 3. MCMC convergence plot
+convergence_plot <- visualize_convergence(ppmx_results$n_clusters_history, burn_in)
+
+# Write results to CSV files for easier viewing
+for (star_rb in names(similar_players_list)) {
+  filename <- paste0("similar_to_", gsub(" ", "_", star_rb), ".csv")
+  write.csv(similar_players_list[[star_rb]], filename, row.names = FALSE)
+}
+write.csv(hidden_gems, "hidden_gems.csv", row.names = FALSE)
+print("Results saved to CSV files")
+
+# Display plots
+print(cluster_plot)
+print(hidden_gems_plot)
+print(convergence_plot)
+
+# Save plots to files
+ggsave("cluster_plot.png", cluster_plot, width = 10, height = 8)
+ggsave("hidden_gems_plot.png", hidden_gems_plot, width = 10, height = 8)
+ggsave("convergence_plot.png", convergence_plot, width = 8, height = 6)
+print("Plots saved as PNG files")
+
+# Display final number of clusters from MCMC
+print(paste("Final number of clusters:", ppmx_results$n_clusters))
+
+print("PPMx analysis complete!")
+```
+
+
+```{r}
+# Create meaningful profiles for each running back cluster using base R
+
+# Load the necessary libraries
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+
+# Create a function to generate cluster profiles
+generate_cluster_profiles <- function(data, clusters, metric_columns) {
+  # Add cluster information to the data
+  data$Cluster <- as.factor(clusters)
+  
+  # Initialize results data frame
+  cluster_ids <- unique(data$Cluster)
+  n_clusters <- length(cluster_ids)
+  
+  cluster_profiles <- data.frame(
+    Cluster = cluster_ids,
+    Count = numeric(n_clusters),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add columns for metrics
+  for (metric in metric_columns) {
+    cluster_profiles[[metric]] <- numeric(n_clusters)
+  }
+  
+  # Add column for RushYds
+  cluster_profiles$RushYds_Avg <- numeric(n_clusters)
+  
+  # Calculate mean values for each cluster
+  for (i in 1:n_clusters) {
+    cluster_id <- cluster_ids[i]
+    cluster_members <- data[data$Cluster == cluster_id, ]
+    
+    # Calculate count
+    cluster_profiles$Count[i] <- nrow(cluster_members)
+    
+    # Calculate average rushing yards
+    if ("RushYds" %in% colnames(data)) {
+      cluster_profiles$RushYds_Avg[i] <- mean(cluster_members$RushYds, na.rm = TRUE)
+    }
+    
+    # Calculate average for each metric
+    for (metric in metric_columns) {
+      if (metric %in% colnames(data)) {
+        cluster_profiles[[metric]][i] <- mean(cluster_members[[metric]], na.rm = TRUE)
+      }
+    }
+  }
+  
+  # Calculate standardized values (z-scores) for easier comparison
+  profile_metrics <- matrix(0, nrow = n_clusters, ncol = length(metric_columns))
+  colnames(profile_metrics) <- metric_columns
+  
+  for (j in 1:length(metric_columns)) {
+    metric <- metric_columns[j]
+    metric_vals <- cluster_profiles[[metric]]
+    profile_metrics[, j] <- scale(metric_vals)
+  }
+  
+  # Create data frame from standardized metrics
+  scaled_metrics <- as.data.frame(profile_metrics)
+  
+  # Add other columns
+  scaled_metrics$Cluster <- cluster_profiles$Cluster
+  scaled_metrics$Count <- cluster_profiles$Count
+  scaled_metrics$RushYds_Avg <- cluster_profiles$RushYds_Avg
+  
+  # Identify dominant traits
+  dominant_traits <- data.frame(
+    Cluster = character(n_clusters),
+    Dominant_Trait = character(n_clusters),
+    Trait_Value = numeric(n_clusters),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:n_clusters) {
+    # Get metric columns only
+    metric_vals <- as.numeric(scaled_metrics[i, metric_columns])
+    # Find the strongest trait (highest z-score)
+    max_idx <- which.max(metric_vals)
+    max_trait <- metric_columns[max_idx]
+    max_val <- metric_vals[max_idx]
+    
+    dominant_traits$Cluster[i] <- as.character(scaled_metrics$Cluster[i])
+    dominant_traits$Dominant_Trait[i] <- max_trait
+    dominant_traits$Trait_Value[i] <- max_val
+  }
+  
+  # Get representative players for each cluster (those closest to center)
+  representative_players <- data.frame(
+    Cluster = character(n_clusters),
+    Representative_Player = character(n_clusters),
+    Player_Season = character(n_clusters),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:n_clusters) {
+    cluster_id <- cluster_ids[i]
+    # Get players in this cluster
+    cluster_members <- data[data$Cluster == cluster_id, ]
+    
+    # Calculate cluster centroid
+    centroid <- numeric(length(metric_columns))
+    for (j in 1:length(metric_columns)) {
+      centroid[j] <- mean(cluster_members[[metric_columns[j]]], na.rm = TRUE)
+    }
+    
+    # Calculate distance of each player to centroid
+    distances <- numeric(nrow(cluster_members))
+    for (j in 1:nrow(cluster_members)) {
+      player_metrics <- numeric(length(metric_columns))
+      for (k in 1:length(metric_columns)) {
+        player_metrics[k] <- cluster_members[j, metric_columns[k]]
+      }
+      distances[j] <- sqrt(sum((player_metrics - centroid)^2, na.rm = TRUE))
+    }
+    
+    # Find player closest to centroid
+    closest_idx <- which.min(distances)
+    representative_player <- as.character(cluster_members$Player[closest_idx])
+    player_season <- as.character(cluster_members$Season[closest_idx])
+    
+    representative_players$Cluster[i] <- as.character(cluster_id)
+    representative_players$Representative_Player[i] <- representative_player
+    representative_players$Player_Season[i] <- player_season
+  }
+  
+  # Merge all profile information
+  final_profiles <- merge(cluster_profiles, dominant_traits, by = "Cluster")
+  final_profiles <- merge(final_profiles, representative_players, by = "Cluster")
+  
+  # Suggest cluster names based on dominant traits and representative players
+  cluster_names <- character(nrow(final_profiles))
+  
+  # Map trait names to more descriptive terms
+  trait_map <- list(
+    "yards.after.contact" = "Power",
+    "Yaftercontact.Att" = "Power",
+    "Yards.before.contact" = "Vision",
+    "YbeforeContact.Att" = "Vision",
+    "RushingBrkTkl" = "Elusiveness",
+    "Rush.Succ." = "Efficiency",
+    "RecBrkTkl" = "Receiving",
+    "AvgDepthOTarget" = "Downfield Threat"
+  )
+  
+  for (i in 1:nrow(final_profiles)) {
+    # Create descriptive name based on dominant trait
+    trait <- final_profiles$Dominant_Trait[i]
+    player <- final_profiles$Representative_Player[i]
+    
+    # Get descriptive term for the trait
+    trait_term <- NULL
+    for (t in names(trait_map)) {
+      if (t == trait) {
+        trait_term <- trait_map[[t]]
+        break
+      }
+    }
+    if (is.null(trait_term)) trait_term <- trait
+    
+    # Create cluster name
+    cluster_names[i] <- paste0("Cluster ", final_profiles$Cluster[i], ": ", 
+                              trait_term, " Specialists (", player, "-type)")
+  }
+  
+  final_profiles$Suggested_Name <- cluster_names
+  
+  return(final_profiles)
+}
+
+# Identify the key metric columns in your data
+key_metrics <- c(
+  "yards.after.contact",      # YAfterContact_Rush
+  "Yaftercontact.Att",        # YAfterContact_Rush (per attempt)
+  "Yards.before.contact",     # YBeforeContact_Rush
+  "YbeforeContact.Att",       # YBeforeContact_Rush (per attempt)
+  "RushingBrkTkl",            # BrokenTackles_Rush
+  "Rush.Succ.",               # SuccessRate
+  "RecBrkTkl",                # RecBrokenTackles_Per
+  "AvgDepthOTarget"           # RecTargets
+)
+
+# Find which of these metrics actually exist in your dataset
+available_metrics <- c()
+for (metric in key_metrics) {
+  if (metric %in% colnames(rb_data)) {
+    available_metrics <- c(available_metrics, metric)
+  } else {
+    # Try partial matching
+    matches <- grep(metric, colnames(rb_data), ignore.case = TRUE)
+    if (length(matches) > 0) {
+      available_metrics <- c(available_metrics, colnames(rb_data)[matches[1]])
+    }
+  }
+}
+
+print(paste("Available metrics for profiling:", paste(available_metrics, collapse=", ")))
+
+# Generate the cluster profiles
+cluster_profiles <- generate_cluster_profiles(
+  data = rb_data,
+  clusters = ppmx_results$final_clusters,
+  metric_columns = available_metrics
+)
+
+# Print the cluster profiles
+print("Cluster Profiles:")
+print(cluster_profiles)
+
+# Save to CSV for easier viewing
+write.csv(cluster_profiles, "cluster_profiles.csv", row.names = FALSE)
+print("Cluster profiles saved to 'cluster_profiles.csv'")
+
+# Create a visualization of the cluster profiles
+visualize_cluster_profiles <- function(profiles, metric_columns) {
+  # Reshape the data for plotting
+  profile_long <- reshape2::melt(
+    profiles,
+    id.vars = c("Cluster", "Suggested_Name"),
+    measure.vars = metric_columns,
+    variable.name = "Metric", 
+    value.name = "Value"
+  )
+  
+  # Create the plot
+  p <- ggplot(profile_long, aes(x = Metric, y = Value, color = Suggested_Name, group = Suggested_Name)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "bottom",
+      legend.title = element_blank()
+    ) +
+    labs(
+      title = "Running Back Cluster Profiles",
+      x = "Metric",
+      y = "Standardized Value (Z-score)"
+    )
+  
+  return(p)
+}
+
+# Create the visualization
+cluster_profile_plot <- visualize_cluster_profiles(
+  profiles = cluster_profiles,
+  metric_columns = available_metrics
+)
+
+# Display the plot
+print(cluster_profile_plot)
+
+# Save the plot
+ggsave("cluster_profiles_plot.png", cluster_profile_plot, width = 12, height = 8)
+print("Cluster profiles visualization saved to 'cluster_profiles_plot.png'")
+
+```
+
+
+```{r}
+# Continuation of previous code
+# This part focuses on creating summary tables and completing the report
+
+# Function to create summary table of star RBs and their most similar players
+create_star_rb_summary_table <- function(similarity_tables, top_n = 3) {
+  # Get all star RBs
+  star_rbs <- names(similarity_tables)
+  
+  # Create a summary table
+  n_stars <- length(star_rbs)
+  n_similar <- top_n
+  
+  # Initialize result table with appropriate columns
+  result <- data.frame(
+    Star_RB = character(n_stars),
+    Season = character(n_stars),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add columns for similar players
+  for (i in 1:n_similar) {
+    result[[paste0("Similar_", i, "_Player")]] <- character(n_stars)
+    result[[paste0("Similar_", i, "_Season")]] <- character(n_stars)
+    result[[paste0("Similar_", i, "_Team")]] <- character(n_stars)
+    result[[paste0("Similar_", i, "_Similarity")]] <- numeric(n_stars)
+  }
+  
+  # Fill the table
+  for (i in 1:n_stars) {
+    star_rb <- star_rbs[i]
+    sim_table <- similarity_tables[[star_rb]]
+    
+    # Get star RB info
+    star_info <- sim_table[1, ]
+    result$Star_RB[i] <- star_info$Player
+    result$Season[i] <- star_info$Season
+    
+    # Get similar players (skip the first row which is the star RB)
+    similar_players <- sim_table[-1, ]
+    
+    # Take top n players
+    top_similar <- similar_players[1:min(n_similar, nrow(similar_players)), ]
+    
+    # Fill similar player info
+    for (j in 1:nrow(top_similar)) {
+      if (j <= n_similar) {
+        result[[paste0("Similar_", j, "_Player")]][i] <- top_similar$Player[j]
+        result[[paste0("Similar_", j, "_Season")]][i] <- top_similar$Season[j]
+        result[[paste0("Similar_", j, "_Team")]][i] <- top_similar$Team[j]
+        result[[paste0("Similar_", j, "_Similarity")]][i] <- top_similar$Similarity[j]
+      }
+    }
+  }
+  
+  # Save to CSV
+  write.csv(result, "star_rb_summary_table.csv", row.names = FALSE)
+  print("Saved star RB summary table to 'star_rb_summary_table.csv'")
+  
+  return(result)
+}
+
+# Function to name clusters based on their characteristics
+name_clusters <- function(cluster_profiles) {
+  # Map trait names to more descriptive terms
+  trait_map <- list(
+    "yards.after.contact" = "Power",
+    "Yaftercontact.Att" = "Power",
+    "Yards.before.contact" = "Vision",
+    "YbeforeContact.Att" = "Vision",
+    "RushingBrkTkl" = "Elusive",
+    "Rush.Succ." = "Efficient",
+    "RecBrkTkl" = "Receiving",
+    "AvgDepthOTarget" = "Downfield"
+  )
+  
+  # Create meaningful names
+  named_clusters <- data.frame(
+    Cluster = cluster_profiles$Cluster,
+    Representative_Player = cluster_profiles$Representative_Player,
+    Dominant_Trait = cluster_profiles$Dominant_Trait,
+    Name = character(nrow(cluster_profiles)),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:nrow(named_clusters)) {
+    trait <- named_clusters$Dominant_Trait[i]
+    player <- named_clusters$Representative_Player[i]
+    
+    # Get descriptive term for the trait
+    trait_term <- NULL
+    for (t in names(trait_map)) {
+      if (grepl(t, trait, ignore.case = TRUE)) {
+        trait_term <- trait_map[[t]]
+        break
+      }
+    }
+    if (is.null(trait_term)) trait_term <- "Balanced"
+    
+    # Create cluster name
+    named_clusters$Name[i] <- paste0(trait_term, " ", player, "-Type")
+  }
+  
+  # Save to CSV
+  write.csv(named_clusters, "named_clusters.csv", row.names = FALSE)
+  print("Saved named clusters to 'named_clusters.csv'")
+  
+  return(named_clusters)
+}
+
+# Function to create a formatted HTML report with tables and visualizations
+create_html_report <- function(cluster_profiles, similarity_tables, hidden_gems) {
+  # Create HTML file
+  html_file <- "rb_analysis_report.html"
+  
+  # Write HTML header
+  cat('<!DOCTYPE html>
+<html>
+<head>
+  <title>Running Back Similarity Analysis</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { color: #2c3e50; text-align: center; }
+    h2 { color: #3498db; margin-top: 30px; }
+    h3 { color: #2980b9; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    img { max-width: 100%; height: auto; margin: 20px 0; }
+    .section { margin-bottom: 40px; }
+    .highlight { font-weight: bold; color: #e74c3c; }
+    .code { font-family: monospace; background-color: #f8f8f8; padding: 2px 4px; }
+  </style>
+</head>
+<body>
+  <h1>Running Back Similarity Analysis</h1>
+  
+  <div class="section">
+    <h2>Executive Summary</h2>
+    <p>
+      This report presents a comprehensive analysis of NFL running backs using the Product Partition Model with Regression on Covariates (PPMx).
+      By analyzing key statistical metrics including yards after contact, broken tackles, and success rate, we identified distinct clusters of 
+      running backs with similar playing styles and performance characteristics.
+    </p>
+    <p>
+      The analysis reveals:
+      <ul>
+        <li>Distinct running back clusters, each representing a different playing style/profile</li>
+        <li>Players most similar to star running backs like Christian McCaffrey, Derrick Henry, and Saquon Barkley</li>
+        <li>Hidden gems - less recognized players who show statistical similarity to star running backs</li>
+      </ul>
+    </p>
+  </div>
+  
+  <div class="section">
+    <h2>Cluster Analysis</h2>
+    <p>
+      We identified ', file = html_file)
+  
+  # Add number of clusters
+  cat(length(unique(cluster_profiles$Cluster)), ' distinct clusters of running backs based on their statistical profiles.
+      Each cluster represents a different playing style or performance profile.
+    </p>
+    
+    <h3>Cluster Characteristics</h3>
+    <table>
+      <tr>
+        <th>Cluster</th>
+        <th>Representative Player</th>
+        <th>Dominant Characteristic</th>
+        <th>Avg. Rush Yards</th>
+        <th>Player Count</th>
+      </tr>', file = html_file, append = TRUE)
+  
+  # Add cluster profiles
+  for (i in 1:nrow(cluster_profiles)) {
+    cat('
+      <tr>
+        <td>', cluster_profiles$Cluster[i], '</td>
+        <td>', cluster_profiles$Representative_Player[i], '</td>
+        <td>', cluster_profiles$Dominant_Trait[i], '</td>
+        <td>', round(cluster_profiles$RushYds_Avg[i], 1), '</td>
+        <td>', cluster_profiles$Count[i], '</td>
+      </tr>', file = html_file, append = TRUE)
+  }
+  
+  cat('
+    </table>
+    
+    <h3>Cluster Visualization</h3>
+    <p>The following visualization shows how running backs are grouped into clusters:</p>
+    <img src="cluster_profiles_plot.png" alt="Cluster Profiles">
+  </div>
+  
+  <div class="section">
+    <h2>Star Running Back Similarity Analysis</h2>
+    <p>
+      For each star running back, we identified the players with the most similar statistical profiles.
+      This similarity is based on the posterior probability of players being clustered together in our PPMx model.
+    </p>', file = html_file, append = TRUE)
+  
+  # Add tables for each star RB
+  for (star_rb in names(similarity_tables)) {
+    cat('
+    <h3>', star_rb, '</h3>
+    <table>
+      <tr>
+        <th>Player</th>
+        <th>Season</th>
+        <th>Team</th>
+        <th>Similarity</th>
+        <th>Rush Yards</th>
+      </tr>', file = html_file, append = TRUE)
+    
+    # Add rows for each similar player
+    similar_players <- similarity_tables[[star_rb]]
+    for (i in 1:min(6, nrow(similar_players))) {
+      cat('
+      <tr>
+        <td>', similar_players$Player[i], '</td>
+        <td>', similar_players$Season[i], '</td>
+        <td>', similar_players$Team[i], '</td>
+        <td>', round(similar_players$Similarity[i], 2), '</td>
+        <td>', similar_players$RushYds[i], '</td>
+      </tr>', file = html_file, append = TRUE)
+    }
+    
+    cat('
+    </table>', file = html_file, append = TRUE)
+  }
+  
+  cat('
+    <h3>Player Comparison</h3>
+    <p>The radar chart below compares key metrics for top running backs:</p>
+    <img src="top_rb_comparison.png" alt="Top RB Comparison">
+  </div>
+  
+  <div class="section">
+    <h2>Hidden Gems Analysis</h2>
+    <p>
+      These running backs show statistical similarities to star players but haven\'t accumulated the same rushing yard totals.
+      They could represent undervalued assets or emerging talents.
+    </p>', file = html_file, append = TRUE)
+  
+  # Add hidden gems table if available
+  if (exists("hidden_gems") && !is.null(hidden_gems) && nrow(hidden_gems) > 0) {
+    cat('
+    <table>
+      <tr>
+        <th>Player</th>
+        <th>Season</th>
+        <th>Team</th>
+        <th>Rush Yards</th>
+        <th>Most Similar Star</th>
+        <th>Similarity</th>
+        <th>Key Strength</th>
+      </tr>', file = html_file, append = TRUE)
+    
+    # Add rows for each hidden gem
+    for (i in 1:min(10, nrow(hidden_gems))) {
+      cat('
+      <tr>
+        <td>', hidden_gems$Player[i], '</td>
+        <td>', hidden_gems$Season[i], '</td>
+        <td>', hidden_gems$Team[i], '</td>
+        <td>', hidden_gems$RushYds[i], '</td>
+        <td>', hidden_gems$Most_Similar_Star[i], '</td>
+        <td>', round(hidden_gems$Similarity_to_Most_Similar[i], 2), '</td>
+        <td>', hidden_gems$Key_Strength[i], '</td>
+      </tr>', file = html_file, append = TRUE)
+    }
+    
+    cat('
+    </table>
+    <img src="hidden_gems_plot.png" alt="Hidden Gems Plot">', file = html_file, append = TRUE)
+  }
+  
+  cat('
+  </div>
+  
+  <div class="section">
+    <h2>Methodology</h2>
+    <p>
+      This analysis uses the Product Partition Model with Regression on Covariates (PPMx) as described by Müller, Quintana, and Rosner.
+      The key features of this approach include:
+    </p>
+    <ol>
+      <li>Bayesian clustering that accounts for multiple statistical dimensions simultaneously</li>
+      <li>Explicit modeling of the relationship between player metrics and cluster membership</li>
+      <li>Similarity between players measured as the posterior probability of co-clustering</li>
+      <li>MCMC convergence monitoring to ensure statistical validity</li>
+    </ol>
+    <p>The MCMC convergence plot shows our model stabilized around the final number of clusters:</p>
+    <img src="convergence_plot.png" alt="MCMC Convergence">
+  </div>
+  
+  <div class="section">
+    <h2>Conclusions and Recommendations</h2>
+    <p>
+      Based on our analysis, we recommend:
+    </p>
+    <ol>
+      <li><strong>Cluster-Based Team Building</strong>: Teams should identify which RB profiles complement their offensive scheme</li>
+      <li><strong>Value Identification</strong>: Hidden gems in our analysis could be undervalued in free agency or trades</li>
+      <li><strong>Player Development</strong>: For young RBs, comparing their profiles to established stars can identify development areas</li>
+    </ol>
+    <p>
+      This analysis demonstrates how advanced statistical methods can reveal meaningful patterns in running back performance.
+      By understanding these patterns, teams can make more informed decisions in player evaluation, development, and acquisition strategies.
+    </p>
+  </div>
+  
+</body>
+</html>', file = html_file, append = TRUE)
+  
+  print(paste("Created HTML report:", html_file))
+  return(html_file)
+}
+
+# Now let's create these additional outputs
+
+# 1. Create a summary table of star RBs and their most similar players
+if (exists("similarity_tables")) {
+  star_rb_summary <- create_star_rb_summary_table(similarity_tables, top_n = 3)
+  print("Created star RB summary table")
+}
+
+# 2. Name the clusters based on their characteristics
+if (exists("cluster_profiles")) {
+  named_clusters <- name_clusters(cluster_profiles)
+  print("Created named clusters")
+}
+
+# 3. Create a comprehensive HTML report
+if (exists("cluster_profiles") && exists("similarity_tables")) {
+  html_report <- create_html_report(cluster_profiles, similarity_tables, 
+                                   if (exists("hidden_gems")) hidden_gems else NULL)
+  print("Created comprehensive HTML report")
+}
+
+# Create a markdown version of the named clusters
+if (exists("named_clusters")) {
+  cat("## Running Back Cluster Types\n\n", file = "cluster_types.md")
+  cat("| Cluster | Representative Player | Style | Description |\n", file = "cluster_types.md", append = TRUE)
+  cat("|---------|----------------------|-------|-------------|\n", file = "cluster_types.md", append = TRUE)
+  
+  for (i in 1:nrow(named_clusters)) {
+    # Create a description based on the dominant trait
+    trait <- named_clusters$Dominant_Trait[i]
+    description <- ""
+    
+    if (grepl("after", trait, ignore.case = TRUE)) {
+      description <- "Excels at breaking tackles and gaining yards after contact"
+    } else if (grepl("before", trait, ignore.case = TRUE)) {
+      description <- "Vision and ability to find holes; benefits from good blocking"
+    } else if (grepl("BrkTkl", trait)) {
+      description <- "Elusive with ability to break tackles and make defenders miss"
+    } else if (grepl("Succ", trait)) {
+      description <- "Consistently gains successful yardage on plays"
+    } else if (grepl("Rec", trait)) {
+      description <- "Strong receiving skills out of the backfield"
+    } else if (grepl("Depth", trait)) {
+      description <- "Targeted downfield in passing game"
+    } else {
+      description <- "Balanced skillset across multiple categories"
+    }
+    
+    cat(paste0("| ", named_clusters$Cluster[i], " | ", 
+              named_clusters$Representative_Player[i], " | ", 
+              named_clusters$Name[i], " | ", 
+              description, " |\n"), 
+        file = "cluster_types.md", append = TRUE)
+  }
+  
+  print("Created markdown file with cluster types: cluster_types.md")
+}
+
+print("Analysis complete! All outputs have been generated.")
+```
+
+```{r}
+create_actual_html_report <- function() {
+  # Create HTML file
+  html_file <- "rb_analysis_report.html"
+  
+  # Open connection to file
+  con <- file(html_file, "w")
+  
+  # Write HTML header
+  writeLines('<!DOCTYPE html>
+<html>
+<head>
+  <title>Running Back Similarity Analysis</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { color: #2c3e50; text-align: center; }
+    h2 { color: #3498db; margin-top: 30px; }
+    table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+  </style>
+</head>
+<body>
+  <h1>Running Back Similarity Analysis</h1>', con)
+  
+  # Add cluster analysis section
+  writeLines('
+  <h2>Cluster Analysis</h2>
+  <p>The analysis identified distinct running back clusters based on statistical profiles.</p>', con)
+  
+  # Try to add cluster information if available
+  if (exists("cluster_profiles")) {
+    writeLines('
+    <h3>Cluster Profiles</h3>
+    <table>
+      <tr>
+        <th>Cluster</th>
+        <th>Representative Player</th>
+        <th>Players in Cluster</th>
+      </tr>', con)
+    
+    # Add some cluster data
+    for (i in 1:nrow(cluster_profiles)) {
+      writeLines(paste0('
+      <tr>
+        <td>', cluster_profiles$Cluster[i], '</td>
+        <td>', cluster_profiles$Representative_Player[i], '</td>
+        <td>', cluster_profiles$Count[i], '</td>
+      </tr>'), con)
+    }
+    
+    writeLines('</table>', con)
+  } else {
+    writeLines('<p>Cluster profiles not available</p>', con)
+  }
+  
+  # Add similarity analysis section
+  writeLines('
+  <h2>Star Running Back Similarity Analysis</h2>
+  <p>Analysis of players most similar to star running backs.</p>', con)
+  
+  # Try to add similarity tables if available
+  if (exists("similarity_tables")) {
+    # Get star names
+    star_names <- names(similarity_tables)
+    
+    for (star_rb in star_names) {
+      writeLines(paste0('
+      <h3>Players Similar to ', star_rb, '</h3>
+      <table>
+        <tr>
+          <th>Player</th>
+          <th>Season</th>
+          <th>Similarity</th>
+        </tr>'), con)
+      
+      # Add top 3 similar players
+      sim_table <- similarity_tables[[star_rb]]
+      for (i in 2:min(4, nrow(sim_table))) {  # Skip first row (the star RB)
+        writeLines(paste0('
+        <tr>
+          <td>', sim_table$Player[i], '</td>
+          <td>', sim_table$Season[i], '</td>
+          <td>', round(sim_table$Similarity[i], 2), '</td>
+        </tr>'), con)
+      }
+      
+      writeLines('</table>', con)
+    }
+  } else {
+    writeLines('<p>Similarity tables not available</p>', con)
+  }
+  
+  # Add hidden gems section
+  writeLines('
+  <h2>Hidden Gems Analysis</h2>
+  <p>Running backs with statistical similarities to stars but lower rushing yards.</p>', con)
+  
+  # Try to add hidden gems if available
+  if (exists("hidden_gems") && !is.null(hidden_gems) && nrow(hidden_gems) > 0) {
+    writeLines('
+    <table>
+      <tr>
+        <th>Player</th>
+        <th>Season</th>
+        <th>Rush Yards</th>
+        <th>Most Similar Star</th>
+      </tr>', con)
+    
+    # Add hidden gems
+    for (i in 1:min(5, nrow(hidden_gems))) {
+      writeLines(paste0('
+      <tr>
+        <td>', hidden_gems$Player[i], '</td>
+        <td>', hidden_gems$Season[i], '</td>
+        <td>', hidden_gems$RushYds[i], '</td>
+        <td>', hidden_gems$Most_Similar_Star[i], '</td>
+      </tr>'), con)
+    }
+    
+    writeLines('</table>', con)
+  } else {
+    writeLines('<p>Hidden gems analysis not available</p>', con)
+  }
+  
+  # Finish HTML
+  writeLines('
+  <h2>Methodology</h2>
+  <p>This analysis uses the Product Partition Model with Regression on Covariates (PPMx) 
+  as described by Müller, Quintana, and Rosner.</p>
+  
+</body>
+</html>', con)
+  
+  # Close connection
+  close(con)
+  
+  if (file.exists(html_file)) {
+    print(paste("Successfully created HTML report:", html_file))
+    return(TRUE)
+  } else {
+    print("Failed to create HTML file")
+    return(FALSE)
+  }
+}
+
+# Run the function
+create_actual_html_report()
+```
+
+```{r}
+# Fixed hidden gems section for HTML report creation
+# Replace just the hidden gems section in the create_enhanced_html_report function
+
+# Add hidden gems section with better error handling
+create_fixed_hidden_gems_section <- function() {
+  # Create HTML file
+  html_file <- "rb_analysis_report.html"
+  
+  # Open connection to file
+  con <- file(html_file, "a")  # Append mode
+  
+  # Write the hidden gems section header
+  writeLines('
+  <div class="section">
+    <h2>Hidden Gems Analysis</h2>
+    <p>
+      These running backs show statistical similarities to star players but haven\'t accumulated the same rushing yard totals.
+      They could represent undervalued assets or emerging talents.
+    </p>', con)
+  
+  # Try to add hidden gems if available
+  if (exists("hidden_gems") && !is.null(hidden_gems) && nrow(hidden_gems) > 0) {
+    # Determine which columns are actually available
+    available_columns <- colnames(hidden_gems)
+    
+    writeLines('
+    <table>
+      <tr>
+        <th>Player</th>
+        <th>Season</th>
+        <th>Team</th>
+        <th>Rush Yards</th>', con)
+    
+    # Only add these columns if they exist
+    if ("Most_Similar_Star" %in% available_columns) {
+      writeLines('
+        <th>Most Similar Star</th>', con)
+    }
+    
+    if ("Similarity_to_Most_Similar" %in% available_columns) {
+      writeLines('
+        <th>Similarity</th>', con)
+    }
+    
+    if ("Key_Strength" %in% available_columns) {
+      writeLines('
+        <th>Key Strength</th>', con)
+    }
+    
+    if ("Avg_Similarity_to_Stars" %in% available_columns) {
+      writeLines('
+        <th>Avg Similarity</th>', con)
+    }
+    
+    writeLines('
+      </tr>', con)
+    
+    # Add hidden gems
+    for (i in 1:min(10, nrow(hidden_gems))) {
+      # Start the row
+      writeLines(paste0('
+      <tr>
+        <td class="hidden-gem">', hidden_gems$Player[i], '</td>
+        <td>', hidden_gems$Season[i], '</td>
+        <td>', hidden_gems$Team[i], '</td>
+        <td>', hidden_gems$RushYds[i], '</td>'), con)
+      
+      # Add Most Similar Star if available
+      if ("Most_Similar_Star" %in% available_columns) {
+        writeLines(paste0('
+        <td>', hidden_gems$Most_Similar_Star[i], '</td>'), con)
+      }
+      
+      # Add Similarity if available (with error handling)
+      if ("Similarity_to_Most_Similar" %in% available_columns) {
+        similarity_value <- hidden_gems$Similarity_to_Most_Similar[i]
+        similarity_class <- ""
+        
+        # Check if it's numeric and can be rounded
+        if (is.numeric(similarity_value) && !is.na(similarity_value) && similarity_value > 0.7) {
+          similarity_class <- "metric-highlight"
+          similarity_formatted <- round(similarity_value, 2)
+        } else if (is.numeric(similarity_value) && !is.na(similarity_value)) {
+          similarity_formatted <- round(similarity_value, 2)
+        } else {
+          similarity_formatted <- as.character(similarity_value)
+        }
+        
+        writeLines(paste0('
+        <td class="', similarity_class, '">', similarity_formatted, '</td>'), con)
+      }
+      
+      # Add Key Strength if available
+      if ("Key_Strength" %in% available_columns) {
+        key_strength <- hidden_gems$Key_Strength[i]
+        if (is.na(key_strength)) key_strength <- ""
+        
+        writeLines(paste0('
+        <td>', key_strength, '</td>'), con)
+      }
+      
+      # Add Average Similarity if available
+      if ("Avg_Similarity_to_Stars" %in% available_columns) {
+        avg_sim_value <- hidden_gems$Avg_Similarity_to_Stars[i]
+        
+        # Check if it's numeric and can be rounded
+        if (is.numeric(avg_sim_value) && !is.na(avg_sim_value)) {
+          avg_sim_formatted <- round(avg_sim_value, 2)
+        } else {
+          avg_sim_formatted <- as.character(avg_sim_value)
+        }
+        
+        writeLines(paste0('
+        <td>', avg_sim_formatted, '</td>'), con)
+      }
+      
+      # Close the row
+      writeLines('
+      </tr>', con)
+    }
+    
+    writeLines('
+    </table>', con)
+  } else {
+    writeLines('
+    <p>Hidden gems analysis not available</p>', con)
+  }
+  
+  # Add hidden gems visualization if available
+  if (file.exists("hidden_gems_plot.png")) {
+    writeLines('
+    <h3>Hidden Gems Visualization</h3>
+    <p>This plot shows the relationship between rushing yards and similarity to star running backs:</p>
+    <img src="hidden_gems_plot.png" alt="Hidden Gems Plot">', con)
+  }
+  
+  writeLines('
+  </div>', con)
+  
+  # Close connection
+  close(con)
+  
+  return(TRUE)
+}
+
+# Function to create a complete HTML report with fixed hidden gems section
+create_fixed_html_report <- function() {
+  # Create HTML file
+  html_file <- "rb_analysis_report.html"
+  
+  # Check if the file already exists and delete it
+  if (file.exists(html_file)) {
+    file.remove(html_file)
+  }
+  
+  # Open connection to file
+  con <- file(html_file, "w")
+  
+  # Write HTML header with improved styling
+  writeLines('<!DOCTYPE html>
+<html>
+<head>
+  <title>Running Back Similarity Analysis</title>
+  <style>
+    body { 
+      font-family: "Helvetica Neue", Arial, sans-serif; 
+      max-width: 1200px; 
+      margin: 0 auto; 
+      padding: 20px;
+      color: #333;
+      line-height: 1.6;
+    }
+    h1 { 
+      color: #2c3e50; 
+      text-align: center; 
+      border-bottom: 2px solid #3498db;
+      padding-bottom: 10px;
+      margin-bottom: 30px;
+    }
+    h2 { 
+      color: #3498db; 
+      margin-top: 40px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 8px;
+    }
+    h3 { color: #2980b9; margin-top: 25px; }
+    table { 
+      border-collapse: collapse; 
+      width: 100%; 
+      margin: 20px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    th, td { 
+      border: 1px solid #ddd; 
+      padding: 12px; 
+      text-align: left; 
+    }
+    th { 
+      background-color: #f8f9fa; 
+      font-weight: bold;
+    }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    tr:hover { background-color: #f2f2f2; }
+    .section { 
+      background-color: white; 
+      padding: 20px; 
+      margin-bottom: 30px;
+      border-radius: 5px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .metric-highlight {
+      font-weight: bold;
+      color: #e74c3c;
+    }
+    .star-player {
+      font-weight: bold;
+      color: #3498db;
+    }
+    .hidden-gem {
+      font-weight: bold;
+      color: #27ae60;
+    }
+    img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 20px auto;
+      border: 1px solid #eee;
+      border-radius: 5px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .cluster-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 20px;
+      margin: 30px 0;
+    }
+    .cluster-card {
+      border: 1px solid #eee;
+      border-radius: 5px;
+      padding: 15px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .cluster-card h4 {
+      margin-top: 0;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 8px;
+    }
+    .two-column {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 800px) {
+      .two-column {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>Running Back Similarity Analysis</h1>
+  
+  <div class="section">
+    <h2>Executive Summary</h2>
+    <p>
+      This report presents a comprehensive analysis of NFL running backs using the Product Partition Model with 
+      Regression on Covariates (PPMx). By analyzing key statistical metrics including yards after contact, 
+      broken tackles, and success rate, we identified distinct clusters of running backs with similar playing 
+      styles and performance characteristics.
+    </p>
+    <p>
+      The analysis reveals:
+    </p>
+    <ul>
+      <li>Distinct running back clusters, each representing a different playing style/profile</li>
+      <li>Players most similar to star running backs like Christian McCaffrey, Derrick Henry, and Saquon Barkley</li>
+      <li>Hidden gems - less recognized players who show statistical similarity to star running backs</li>
+    </ul>
+  </div>', con)
+  
+  # Close the connection for now
+  close(con)
+  
+  # Add cluster analysis section
+  con <- file(html_file, "a")
+  writeLines('
+  <div class="section">
+    <h2>Cluster Analysis</h2>', con)
+  
+  # Try to add cluster information if available
+  if (exists("cluster_profiles") && !is.null(cluster_profiles) && nrow(cluster_profiles) > 0) {
+    writeLines(paste0('
+    <p>The analysis identified <span class="metric-highlight">', 
+                     nrow(cluster_profiles), 
+                     '</span> distinct clusters of running backs based on their statistical profiles.</p>'), con)
+    
+    writeLines('
+    <h3>Cluster Profiles</h3>
+    <table>
+      <tr>
+        <th>Cluster</th>
+        <th>Representative Player</th>
+        <th>Dominant Trait</th>
+        <th>Avg. Rush Yards</th>
+        <th>Players in Cluster</th>
+      </tr>', con)
+    
+    # Add cluster data
+    for (i in 1:nrow(cluster_profiles)) {
+      writeLines(paste0('
+      <tr>
+        <td>', cluster_profiles$Cluster[i], '</td>
+        <td class="star-player">', cluster_profiles$Representative_Player[i], '</td>
+        <td class="metric-highlight">', cluster_profiles$Dominant_Trait[i], '</td>
+        <td>', round(cluster_profiles$RushYds_Avg[i], 1), '</td>
+        <td>', cluster_profiles$Count[i], '</td>
+      </tr>'), con)
+    }
+    
+    writeLines('</table>', con)
+    
+    # Add named clusters if available
+    if (exists("named_clusters") && !is.null(named_clusters) && nrow(named_clusters) > 0) {
+      writeLines('
+      <h3>Cluster Types</h3>
+      <div class="cluster-grid">', con)
+      
+      for (i in 1:nrow(named_clusters)) {
+        # Create a description based on the dominant trait
+        trait <- named_clusters$Dominant_Trait[i]
+        description <- ""
+        
+        if (grepl("after", trait, ignore.case = TRUE)) {
+          description <- "Excels at breaking tackles and gaining yards after contact"
+        } else if (grepl("before", trait, ignore.case = TRUE)) {
+          description <- "Vision and ability to find holes; benefits from good blocking"
+        } else if (grepl("BrkTkl", trait)) {
+          description <- "Elusive with ability to break tackles and make defenders miss"
+        } else if (grepl("Succ", trait)) {
+          description <- "Consistently gains successful yardage on plays"
+        } else if (grepl("Rec", trait)) {
+          description <- "Strong receiving skills out of the backfield"
+        } else if (grepl("Depth", trait)) {
+          description <- "Targeted downfield in passing game"
+        } else {
+          description <- "Balanced skillset across multiple categories"
+        }
+        
+        writeLines(paste0('
+        <div class="cluster-card">
+          <h4>', named_clusters$Name[i], '</h4>
+          <p><strong>Cluster ID:</strong> ', named_clusters$Cluster[i], '</p>
+          <p><strong>Example Player:</strong> ', named_clusters$Representative_Player[i], '</p>
+          <p><strong>Style:</strong> ', description, '</p>
+        </div>'), con)
+      }
+      
+      writeLines('
+      </div>', con)
+    }
+  } else {
+    writeLines('<p>Cluster profiles not available</p>', con)
+  }
+  
+  # Add cluster visualization
+  if (file.exists("cluster_profiles_plot.png")) {
+    writeLines('
+    <h3>Cluster Visualization</h3>
+    <p>The following visualization shows the statistical profile of each cluster:</p>
+    <img src="cluster_profiles_plot.png" alt="Cluster Profiles">', con)
+  }
+  
+  # Add PCA plot if available
+  if (file.exists("cluster_plot.png")) {
+    writeLines('
+    <h3>Running Back Clusters</h3>
+    <p>This plot shows how running backs are grouped into clusters in the principal component space:</p>
+    <img src="cluster_plot.png" alt="Running Back Clusters">', con)
+  }
+  
+  writeLines('
+  </div>', con)
+  
+  # Add similarity analysis section
+  writeLines('
+  <div class="section">
+    <h2>Star Running Back Similarity Analysis</h2>
+    <p>
+      For each star running back, we identified the players with the most similar statistical profiles.
+      This similarity is based on the posterior probability of players being clustered together in our PPMx model.
+    </p>', con)
+  
+  # Try to add similarity tables if available
+  if (exists("similarity_tables") && length(similarity_tables) > 0) {
+    # Get star names
+    star_names <- names(similarity_tables)
+    
+    # Create a two-column layout
+    writeLines('
+    <div class="two-column">', con)
+    
+    for (star_rb in star_names) {
+      writeLines(paste0('
+      <div>
+        <h3>Players Similar to <span class="star-player">', star_rb, '</span></h3>
+        <table>
+          <tr>
+            <th>Player</th>
+            <th>Season</th>
+            <th>Team</th>
+            <th>Similarity</th>
+          </tr>'), con)
+      
+      # Add top 5 similar players
+      sim_table <- similarity_tables[[star_rb]]
+      for (i in 2:min(6, nrow(sim_table))) {  # Skip first row (the star RB)
+        similarity_class <- ""
+        if (is.numeric(sim_table$Similarity[i]) && sim_table$Similarity[i] > 0.8) {
+          similarity_class <- "metric-highlight"
+        }
+        
+        # Format similarity with error handling
+        if (is.numeric(sim_table$Similarity[i])) {
+          sim_formatted <- round(sim_table$Similarity[i], 2)
+        } else {
+          sim_formatted <- as.character(sim_table$Similarity[i])
+        }
+        
+        writeLines(paste0('
+        <tr>
+          <td>', sim_table$Player[i], '</td>
+          <td>', sim_table$Season[i], '</td>
+          <td>', sim_table$Team[i], '</td>
+          <td class="', similarity_class, '">', sim_formatted, '</td>
+        </tr>'), con)
+      }
+      
+      writeLines('
+        </table>
+      </div>', con)
+    }
+    
+    writeLines('
+    </div>', con)
+  } else {
+    writeLines('<p>Similarity tables not available</p>', con)
+  }
+  
+  # Add radar chart if available
+  if (file.exists("top_rb_comparison.png")) {
+    writeLines('
+    <h3>Player Comparison</h3>
+    <p>The radar chart below compares key metrics for top running backs:</p>
+    <img src="top_rb_comparison.png" alt="Top RB Comparison">', con)
+  }
+  
+  writeLines('
+  </div>', con)
+  
+  # Close connection before calling the hidden gems function
+  close(con)
+  
+  # Call the fixed hidden gems section function
+  create_fixed_hidden_gems_section()
+  
+  # Continue with the rest of the HTML report
+  con <- file(html_file, "a")
+  
+  # Add methodology section
+  writeLines('
+  <div class="section">
+    <h2>Methodology</h2>
+    <p>
+      This analysis uses the Product Partition Model with Regression on Covariates (PPMx) as described by 
+      Müller, Quintana, and Rosner. The key features of this approach include:
+    </p>
+    <ol>
+      <li>Bayesian clustering that accounts for multiple statistical dimensions simultaneously</li>
+      <li>Explicit modeling of the relationship between player metrics and cluster membership</li>
+      <li>Similarity between players measured as the posterior probability of co-clustering</li>
+      <li>MCMC convergence monitoring to ensure statistical validity</li>
+    </ol>', con)
+  
+  # Add MCMC convergence plot if available
+  if (file.exists("convergence_plot.png")) {
+    writeLines('
+    <p>The MCMC convergence plot shows our model stabilized around the final number of clusters:</p>
+    <img src="convergence_plot.png" alt="MCMC Convergence">', con)
+  }
+  
+  writeLines('
+  </div>', con)
+  
+  # Add conclusions section
+  writeLines('
+  <div class="section">
+    <h2>Conclusions and Recommendations</h2>
+    <p>
+      Based on our analysis, we recommend:
+    </p>
+    <ol>
+      <li><strong>Cluster-Based Team Building</strong>: Teams should identify which RB profiles complement their offensive scheme</li>
+      <li><strong>Value Identification</strong>: Hidden gems in our analysis could be undervalued in free agency or trades</li>
+      <li><strong>Player Development</strong>: For young RBs, comparing their profiles to established stars can identify development areas</li>
+    </ol>
+    <p>
+      This analysis demonstrates how advanced statistical methods can reveal meaningful patterns in running back performance.
+      By understanding these patterns, teams can make more informed decisions in player evaluation, development, and acquisition strategies.
+    </p>
+  </div>
+  
+  <div class="section">
+    <h2>Data Sources and References</h2>
+    <p>
+      This analysis used statistical metrics from a dataset of running backs across multiple NFL seasons. The methodology
+      is based on the following research paper:
+    </p>
+    <p>
+      Müller, P., Quintana, F., & Rosner, G. L. (2011). A Product Partition Model With Regression on Covariates. 
+      <em>Journal of Computational and Graphical Statistics</em>, 20(1), 260-278.
+    </p>
+  </div>
+  
+  <footer style="text-align: center; margin-top: 30px; padding: 20px; border-top: 1px solid #eee; color: #777;">
+    <p>Running Back Similarity Analysis | Generated on ', format(Sys.time(), "%B %d, %Y"), '</p>
+  </footer>
+  
+</body>
+</html>', con)
+  
+  # Close connection
+  close(con)
+  
+  if (file.exists(html_file)) {
+    print(paste("Successfully created fixed HTML report:", html_file))
+    # Try to open the HTML report in the default browser
+    try(browseURL(html_file), silent = TRUE)
+    return(TRUE)
+  } else {
+    print("Failed to create HTML file")
+    return(FALSE)
+  }
+}
+
+# Run the fixed HTML report creation
+create_fixed_html_report()
+
+
+
+```
+
+
+
