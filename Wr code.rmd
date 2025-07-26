@@ -1,0 +1,4342 @@
+# ---
+# title: "Wide Receiver Clustering Analysis"
+# output: html_document
+# date: "2025-03-11"
+# ---
+```{r}
+# Load required packages
+library(nimble)
+library(label.switching)
+library(tidyverse)
+library(MCMCpack)  # For Dirichlet distribution
+library(fmsb)      # For radar charts
+library(viridis)   # For better color palettes
+library(ggrepel)   # For better text labels in plots
+library(corrplot)  # For correlation visualization
+
+# Setting up the working directory - modify as needed
+# setwd("YOUR/DIRECTORY/PATH")
+
+# Read the wide receiver data
+wr_data <- read.csv("WR Stats all.csv", skip = 1) # Skip the header row
+
+# Print dimensions for verification
+print(dim(wr_data))
+
+# Rename the columns for better usability
+colnames(wr_data) <- c("Rank", "Player", "Tgt_raw", "Season", "Age", "Team", 
+                     "Games", "GS", "Tgt", "Rec", "RecYds", "Y_Rec", "RECTD", 
+                     "RecY_G", "Ctch_pct", "Yard_Tgt", "Rec1D", "RecSucc_pct", 
+                     "AirYards", "AirY_Rec", "YAC", "YAC_R", "AvgDepthTarget",
+                     "RecBrkTkl", "Rec_Br", "Drop", "Drop_pct", "Int", "PasserRating")
+
+# Display the first few rows to verify
+print(head(wr_data))
+
+# Function to prepare WR data for clustering
+prepare_wr_data <- function(data) {
+  # Create a data frame with our selected columns
+  wr_metrics <- data.frame(
+    Player = data$Player,
+    Team = data$Team,
+    Season = data$Season,
+    
+    # Key performance metrics for wide receivers
+    Tgt = as.numeric(as.character(data$Tgt)),               # Targets
+    Rec = as.numeric(as.character(data$Rec)),               # Receptions
+    RecYds = as.numeric(as.character(data$RecYds)),         # Receiving Yards
+    RECTD = as.numeric(as.character(data$RECTD)),           # Receiving TDs
+    Ctch_pct = as.numeric(as.character(data$Ctch_pct)),     # Catch Percentage
+    Yard_Tgt = as.numeric(as.character(data$Yard_Tgt)),     # Yards per Target
+    Rec1D = as.numeric(as.character(data$Rec1D)),           # First Downs
+    RecSucc_pct = as.numeric(as.character(data$RecSucc_pct)), # Success Rate
+    AirYards = as.numeric(as.character(data$AirYards)),     # Air Yards
+    AirY_Rec = as.numeric(as.character(data$AirY_Rec)),     # Air Yards per Reception
+    YAC = as.numeric(as.character(data$YAC)),               # Yards After Catch
+    YAC_R = as.numeric(as.character(data$YAC_R)),           # YAC per Reception
+    AvgDepthTarget = as.numeric(as.character(data$AvgDepthTarget)), # Avg Depth of Target
+    RecBrkTkl = as.numeric(as.character(data$RecBrkTkl)),   # Broken Tackles
+    Drop_pct = as.numeric(as.character(data$Drop_pct))      # Drop Percentage
+  )
+  
+  # Show a preview
+  print(head(wr_metrics))
+  
+  # Filter out rows with missing values or invalid data
+  wr_metrics <- wr_metrics %>%
+    filter(!is.na(Tgt) & 
+           !is.na(Rec) &
+           !is.na(RecYds) &
+           !is.na(RECTD))
+  
+  # Create standardized versions of the metrics
+  wr_metrics$scaled_Tgt <- scale(wr_metrics$Tgt)
+  wr_metrics$scaled_Rec <- scale(wr_metrics$Rec)
+  wr_metrics$scaled_RecYds <- scale(wr_metrics$RecYds)
+  wr_metrics$scaled_RECTD <- scale(wr_metrics$RECTD)
+  wr_metrics$scaled_Ctch_pct <- scale(wr_metrics$Ctch_pct)
+  wr_metrics$scaled_Yard_Tgt <- scale(wr_metrics$Yard_Tgt)
+  wr_metrics$scaled_Rec1D <- scale(wr_metrics$Rec1D)
+  wr_metrics$scaled_RecSucc_pct <- scale(wr_metrics$RecSucc_pct)
+  wr_metrics$scaled_AirYards <- scale(wr_metrics$AirYards)
+  wr_metrics$scaled_AirY_Rec <- scale(wr_metrics$AirY_Rec)
+  wr_metrics$scaled_YAC <- scale(wr_metrics$YAC)
+  wr_metrics$scaled_YAC_R <- scale(wr_metrics$YAC_R)
+  wr_metrics$scaled_AvgDepthTarget <- scale(wr_metrics$AvgDepthTarget)
+  wr_metrics$scaled_RecBrkTkl <- scale(wr_metrics$RecBrkTkl)
+  wr_metrics$scaled_Drop_pct <- scale(wr_metrics$Drop_pct)
+  
+  return(wr_metrics)
+}
+
+# Apply the data preparation function
+wr_metrics <- prepare_wr_data(wr_data)
+
+# Check the structure of the prepared data
+head(wr_metrics)
+summary(wr_metrics)
+
+# Check correlations between metrics
+scaled_cols <- grep("^scaled_", names(wr_metrics), value = TRUE)
+cor_matrix <- cor(wr_metrics[, scaled_cols], use = "complete.obs")
+corrplot(cor_matrix, method = "circle")
+
+# Now, define the partial membership model using Nimble
+# This follows the approach from the research paper
+
+# Revised model code for WR clustering
+wr_pm_code <- nimbleCode({
+  # Priors for mean parameters (cluster centers)
+  for(k in 1:K) {
+    for(j in 1:J) {
+      mu[k, j] ~ dnorm(0, 0.1)  # Prior for cluster means
+      sigma[k, j] ~ dunif(0.1, 2)  # Prior for standard deviation
+    }
+  }
+  
+  # Prior for Dirichlet parameter
+  delta ~ dunif(0, 10)  # Following the paper's approach
+  
+  # Create fixed vector for Dirichlet distribution
+  for(k in 1:K) {
+    delta_vec[k] <- delta  # Create a vector of identical delta values
+  }
+  
+  # For each player
+  for(i in 1:N) {
+    # Membership weights follow Dirichlet distribution
+    alpha[i, 1:K] ~ ddirch(delta_vec[1:K])  
+    
+    # For each performance stat
+    for(j in 1:J) {
+      # Calculate expected value for this player's jth stat
+      mu_ij[i, j] <- inprod(alpha[i, 1:K], mu[1:K, j])
+      
+      # Calculate variance
+      var_temp[i, j] <- inprod(alpha[i, 1:K], sigma[1:K, j]^2)
+      prec_ij[i, j] <- 1/var_temp[i, j]
+      
+      # Data likelihood
+      X[i, j] ~ dnorm(mu_ij[i, j], prec_ij[i, j])
+    }
+  }
+})
+
+# Extract the standardized matrix for modeling
+X_wr <- as.matrix(wr_metrics[, scaled_cols])
+
+# Set up constants
+N_wr <- nrow(X_wr)  # Number of players
+J_wr <- ncol(X_wr)  # Number of metrics
+
+# Run for different K values to find optimal number of clusters
+K_values <- 2:5
+waic_results_wr <- vector("list", length(K_values))
+
+for(i in 1:length(K_values)) {
+  K <- K_values[i]
+  
+  # Constants for the model
+  constants <- list(
+    N = N_wr,
+    J = J_wr,
+    K = K
+  )
+  
+  # Data for the model
+  data <- list(
+    X = X_wr
+  )
+  
+  # Initial values
+  inits <- list(
+    mu = matrix(rnorm(K*J_wr, 0, 0.1), K, J_wr),
+    sigma = matrix(runif(K*J_wr, 0.5, 1.5), K, J_wr),
+    alpha = matrix(rdirichlet(N_wr, rep(1, K)), N_wr, K),
+    delta = 1,
+    delta_vec = rep(1, K)
+  )
+  
+  # Build and compile the model
+  wr_model <- nimbleModel(wr_pm_code, constants = constants, data = data, inits = inits)
+  compiled_model <- compileNimble(wr_model)
+  
+  # Set up MCMC configuration
+  mcmc_conf <- configureMCMC(wr_model, monitors = c("mu", "sigma", "alpha", "delta"), enableWAIC = TRUE)
+  mcmc <- buildMCMC(mcmc_conf)
+  compiled_mcmc <- compileNimble(mcmc, project = wr_model)
+  
+  # Run the MCMC
+  cat("Running model with K =", K, "\n")
+  samples <- runMCMC(compiled_mcmc, 
+                   niter = 10000,      # Iterations
+                   nburnin = 2000,     # Burn-in period
+                   thin = 20,          # Thinning interval
+                   summary = TRUE,
+                   WAIC = TRUE)        # Calculate WAIC for model comparison
+  
+  # Extract WAIC value
+  waic_value <- as.numeric(samples$WAIC$WAIC)
+  
+  # Store results
+  waic_results_wr[[i]] <- list(
+    K = K,
+    WAIC = waic_value,
+    samples = samples
+  )
+  
+  cat("Completed. WAIC =", waic_value, "\n\n")
+}
+
+# Find optimal K
+waic_values_wr <- sapply(waic_results_wr, function(x) x$WAIC)
+optimal_K_wr <- K_values[which.min(waic_values_wr)]
+cat("Optimal number of clusters for WRs:", optimal_K_wr, "\n")
+
+# Use results from optimal model for further analysis
+optimal_samples_wr <- waic_results_wr[[which.min(waic_values_wr)]]$samples
+
+# For stability in interpreting results, we'll use K=3 (similar to the RB analysis)
+# This helps avoid label switching issues and makes interpretation more intuitive
+K_wr <- 3  
+
+# Re-run the model with K=3
+cat("Re-running the model with K =", K_wr, "for consistency\n")
+
+# Extract samples from the K=3 run
+optimal_samples_wr <- waic_results_wr[[which(K_values == K_wr)]]$samples
+
+# Extract the relevant samples
+alpha_samples <- optimal_samples_wr$samples[, grep("alpha", colnames(optimal_samples_wr$samples))]
+mu_samples <- optimal_samples_wr$samples[, grep("mu", colnames(optimal_samples_wr$samples))]
+
+# Process the cluster centers directly (skip label switching)
+cat("Processing cluster results directly...\n")
+
+# Calculate mean alphas (membership weights)
+alpha_means <- matrix(0, nrow = N_wr, ncol = K_wr)
+colnames(alpha_means) <- paste0("Cluster", 1:K_wr)
+rownames(alpha_means) <- wr_metrics$Player
+
+for(i in 1:N_wr) {
+  for(k in 1:K_wr) {
+    alpha_means[i, k] <- mean(alpha_samples[, paste0("alpha[", i, ", ", k, "]")])
+  }
+}
+
+# Calculate mean mus (cluster centers)
+mu_means <- array(0, dim = c(K_wr, J_wr))
+colnames(mu_means) <- scaled_cols
+rownames(mu_means) <- paste0("Cluster", 1:K_wr)
+
+for(k in 1:K_wr) {
+  for(j in 1:J_wr) {
+    mu_means[k, j] <- mean(mu_samples[, paste0("mu[", k, ", ", j, "]")])
+  }
+}
+
+# Order clusters by size for consistency
+cluster_sizes <- colSums(alpha_means)
+print("Cluster sizes (sum of membership weights):")
+print(cluster_sizes)
+
+# Order indices
+order_idx <- order(cluster_sizes, decreasing = TRUE)
+
+# Reorder mu and alpha
+mean_mu_wr <- mu_means[order_idx, ]
+rownames(mean_mu_wr) <- paste0("Cluster", 1:K_wr)
+mean_alpha_wr <- alpha_means[, order_idx]
+colnames(mean_alpha_wr) <- paste0("Cluster", 1:K_wr)
+
+# Now continue with visualization and interpretation...
+# Create a data frame for cluster profiles
+wr_cluster_profiles <- as.data.frame(mean_mu_wr) %>%
+  rownames_to_column("Cluster") %>%
+  pivot_longer(-Cluster, names_to = "Metric", values_to = "Value")
+
+# Plot cluster profiles
+ggplot(wr_cluster_profiles, aes(x = Metric, y = Value, color = Cluster, group = Cluster)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "WR Cluster Profiles", y = "Standardized Value")
+
+# Create a data frame for archetypal players
+archetypal_wrs <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season,
+  mean_alpha_wr
+)
+
+# Find top players for each cluster
+for(k in 1:K_wr) {
+  cat("\nCluster", k, "archetypes:\n")
+  cluster_col <- paste0("Cluster", k)
+  top_players <- archetypal_wrs[order(archetypal_wrs[, cluster_col], decreasing = TRUE), ]
+  print(head(top_players[, c("Player", "Team", "Season", cluster_col)], 5))
+}
+
+# Create radar charts for each cluster
+# Convert back to unstandardized values for interpretation
+metrics_means <- colMeans(wr_metrics[, c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", 
+                                         "Yard_Tgt", "Rec1D", "AirYards", "YAC_R", 
+                                         "AvgDepthTarget", "RecBrkTkl", "Drop_pct")])
+metrics_sds <- apply(wr_metrics[, c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", 
+                                    "Yard_Tgt", "Rec1D", "AirYards", "YAC_R", 
+                                    "AvgDepthTarget", "RecBrkTkl", "Drop_pct")], 2, sd)
+
+# Choose a subset of important metrics for better visualization
+key_metrics <- c("scaled_Tgt", "scaled_Rec", "scaled_RecYds", "scaled_RECTD",
+                "scaled_Ctch_pct", "scaled_Yard_Tgt", "scaled_AirY_Rec", 
+                "scaled_YAC_R", "scaled_AvgDepthTarget", "scaled_RecBrkTkl", "scaled_Drop_pct")
+
+key_metrics_original <- gsub("scaled_", "", key_metrics)
+
+# Map standardized to original metrics
+unstandardized_profiles <- matrix(0, nrow = K_wr, ncol = length(key_metrics_original))
+colnames(unstandardized_profiles) <- key_metrics_original
+
+for(j in 1:length(key_metrics)) {
+  col_name <- key_metrics[j]
+  original_col <- key_metrics_original[j]
+  col_idx <- which(colnames(mean_mu_wr) == col_name)
+  
+  if(!is.na(col_idx)) {
+    idx_in_metrics <- which(colnames(wr_metrics) == original_col)
+    if(length(idx_in_metrics) > 0) {
+      sd_val <- sd(wr_metrics[, original_col], na.rm = TRUE)
+      mean_val <- mean(wr_metrics[, original_col], na.rm = TRUE)
+      unstandardized_profiles[, j] <- mean_mu_wr[, col_idx] * sd_val + mean_val
+    }
+  }
+}
+
+# For each cluster, create a radar chart
+for(k in 1:K_wr) {
+  cluster_data <- rbind(
+    apply(wr_metrics[, key_metrics_original], 2, max, na.rm = TRUE),
+    apply(wr_metrics[, key_metrics_original], 2, min, na.rm = TRUE),
+    unstandardized_profiles[k, ]
+  )
+  
+  # Create radar chart
+  radarchart(cluster_data, 
+             title = paste("Cluster", k, "Profile"),
+             pcol = viridis(1), 
+             pfcol = alpha(viridis(1), 0.5))
+}
+
+# Create pie charts for selected players
+# Choose some interesting players with mixed memberships
+
+# Find archetypal players for each cluster
+top_archetypal_players <- c()
+for(k in 1:K_wr) {
+  cluster_col <- paste0("Cluster", k)
+  top_archetypal_players <- c(top_archetypal_players, 
+                             archetypal_wrs$Player[which.max(archetypal_wrs[, cluster_col])])
+}
+
+# Also find players with more mixed memberships
+mixed_players <- archetypal_wrs %>%
+  mutate(max_membership = apply(archetypal_wrs[, paste0("Cluster", 1:K_wr)], 1, max),
+         entropy = -apply(archetypal_wrs[, paste0("Cluster", 1:K_wr)], 1, 
+                          function(x) sum(x * log(x + 1e-10)))) %>%
+  filter(max_membership < 0.6) %>%
+  arrange(desc(entropy)) %>%
+  head(3) %>%
+  pull(Player)
+
+selected_wrs <- c(top_archetypal_players, mixed_players)
+
+# Create membership data for plotting
+wr_membership_data <- archetypal_wrs %>%
+  filter(Player %in% selected_wrs) %>%
+  pivot_longer(cols = starts_with("Cluster"), 
+               names_to = "Cluster", 
+               values_to = "Membership")
+
+# Create pie charts
+ggplot(wr_membership_data, aes(x = "", y = Membership, fill = Cluster)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  facet_wrap(~ Player, ncol = 2) +
+  theme_void() +
+  scale_fill_viridis_d() +
+  labs(title = "WR Membership to Clusters")
+
+# Now interpret the clusters based on their profiles
+cluster_names <- vector("character", K_wr)
+
+# Based on the output of the cluster profiles, assign meaningful names
+# This will need to be adjusted based on actual results
+cluster_names[1] <- "Possession/Slot Receiver"
+cluster_names[2] <- "Deep Threat/Big Play Receiver"
+cluster_names[3] <- "Balanced/Do-it-all Receiver"
+
+# Create a summary table with interpretations
+wr_styles <- data.frame(
+  Cluster = paste0("Cluster", 1:K_wr),
+  Style = cluster_names,
+  Description = c(
+    "High catch rate receivers focusing on shorter routes, reliable hands, and YAC",
+    "Vertical threats specializing in deep routes, explosive plays, and stretching the field",
+    "Elite all-around performers excelling in volume, efficiency, and versatility"
+  )[1:K_wr]  # This needs to be refined based on actual results
+)
+
+# Print the style interpretations
+print(wr_styles)
+
+# Create a visualization showing player archetypes
+# Dimension reduction for visualization (PCA)
+pca_wr <- prcomp(mean_alpha_wr, scale. = TRUE)
+pca_coords_wr <- as.data.frame(pca_wr$x[, 1:2])
+pca_coords_wr$player <- wr_metrics$Player
+pca_coords_wr$team <- wr_metrics$Team
+pca_coords_wr$season <- wr_metrics$Season
+
+# Find the dominant cluster for each player for coloring
+wr_membership <- as.data.frame(mean_alpha_wr)
+wr_membership$dominant_cluster <- apply(wr_membership, 1, which.max)
+pca_coords_wr$dominant_cluster <- factor(wr_membership$dominant_cluster)
+
+# Create scatter plot with player names
+ggplot(pca_coords_wr, aes(x = PC1, y = PC2, color = dominant_cluster)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text_repel(aes(label = player), size = 3, max.overlaps = 15) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "Wide Receiver Style Map",
+       subtitle = "Based on Partial Membership Model",
+       x = "Principal Component 1", 
+       y = "Principal Component 2",
+       color = "Primary Style")
+
+# Save results
+saveRDS(list(
+  metrics = wr_metrics,
+  samples = optimal_samples_wr,
+  mean_mu = mean_mu_wr,
+  mean_alpha = mean_alpha_wr,
+  cluster_names = cluster_names,
+  archetypal_players = archetypal_wrs
+), "wr_clustering_results.rds")
+
+# Get full player cluster membership data
+# This shows each player's membership percentage in each cluster
+player_clusters <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season,
+  Cluster1 = mean_alpha_wr[, "Cluster1"],
+  Cluster2 = mean_alpha_wr[, "Cluster2"],
+  Cluster3 = mean_alpha_wr[, "Cluster3"]
+)
+
+# Calculate primary cluster for each player
+player_clusters$PrimaryCluster <- apply(player_clusters[, c("Cluster1", "Cluster2", "Cluster3")], 1, which.max)
+
+# Sort by player name for easy reference
+sorted_players <- player_clusters[order(player_clusters$Player), ]
+print(head(sorted_players, 20))
+
+# Check where key players are classified
+target_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp", "DeVonta Smith", "CeeDee Lamb")
+for(player in target_players) {
+  player_rows <- grep(player, player_clusters$Player, fixed = TRUE)
+  if(length(player_rows) > 0) {
+    cat("\n", player, "'s Cluster Memberships:\n")
+    print(player_clusters[player_rows, ])
+  }
+}
+
+# Find Hidden Gems analysis
+# First, define a list of star WRs to exclude
+star_wrs <- c(
+  "Tyreek Hill", "Justin Jefferson", "Davante Adams", "Cooper Kupp", 
+  "Stefon Diggs", "Ja'Marr Chase", "CeeDee Lamb", "Deebo Samuel",
+  "DK Metcalf", "Mike Evans", "DeVonta Smith", "A.J. Brown", 
+  "Keenan Allen", "Amon-Ra St. Brown", "Terry McLaurin", "Jaylen Waddle",
+  "Calvin Ridley", "Chris Godwin", "Tyler Lockett", "Michael Pittman Jr.",
+  "Garrett Wilson", "Drake London", "Brandon Aiyuk", "Tee Higgins"
+)
+
+# Create a version of player_clusters that excludes star WRs
+hidden_gems_candidates <- player_clusters %>%
+  filter(!Player %in% star_wrs)
+
+# Calculate balance scores (similar to RB analysis)
+hidden_gems_candidates$balanced_score <- hidden_gems_candidates$Cluster1 * 
+                                        hidden_gems_candidates$Cluster2 * 
+                                        hidden_gems_candidates$Cluster3 * 8
+
+hidden_gems_candidates$receiving_playmaking_sum <- hidden_gems_candidates$Cluster1 + 
+                                                  hidden_gems_candidates$Cluster3
+
+# Find WRs with meaningful membership in multiple clusters
+balanced_wrs <- hidden_gems_candidates %>%
+  # Filter for players with balanced abilities
+  filter(Cluster1 > 0.25 & Cluster2 > 0.25 | 
+         Cluster1 > 0.25 & Cluster3 > 0.25 | 
+         Cluster2 > 0.25 & Cluster3 > 0.25) %>%
+  # Sort by balanced score
+  arrange(desc(balanced_score)) %>%
+  # Take top 15 for visualization
+  head(15)
+
+# Print the top balanced WRs
+print("Top Balanced WRs (Strong in multiple skill areas):")
+print(balanced_wrs[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "balanced_score")])
+
+# Add original metrics for these players for additional context
+balanced_wr_metrics <- balanced_wrs %>%
+  left_join(wr_metrics %>% select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R),
+            by = c("Player", "Team", "Season"))
+
+# Print the balanced WRs with their performance metrics
+print("Top Hidden Gems with Performance Metrics:")
+print(balanced_wr_metrics %>% 
+        select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R, balanced_score) %>% 
+        arrange(desc(balanced_score)))
+
+# Calculate specific skill combinations for different WR profiles
+balanced_wr_metrics <- balanced_wr_metrics %>%
+  mutate(
+    # Possession + Deep score (possession receiver who can stretch the field)
+    possession_deep_score = Cluster1 * Cluster2 * 4,
+    
+    # Possession + Balanced score (reliable possession receiver with all-around skills)
+    possession_balanced_score = Cluster1 * Cluster3 * 4,
+    
+    # Deep + Balanced score (big-play threat with all-around capabilities)
+    deep_balanced_score = Cluster2 * Cluster3 * 4
+  )
+
+# Create a custom scatter plot to visualize balanced WRs
+ggplot(player_clusters, aes(x = Cluster2, y = Cluster1)) +
+  # Add quadrant lines
+  geom_vline(xintercept = 0.33, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = 0.33, linetype = "dashed", color = "gray") +
+  # Plot all players as small points
+  geom_point(color = "gray", alpha = 0.3) +
+  # Highlight the balanced players
+  geom_point(data = balanced_wrs, aes(size = balanced_score, color = receiving_playmaking_sum), alpha = 0.8) +
+  # Add labels to the top balanced players
+  geom_text_repel(data = head(balanced_wrs, 10), 
+                  aes(label = paste0(Player, " (", Season, ")")), 
+                  size = 3, 
+                  nudge_y = 0.03,
+                  max.overlaps = 10) +
+  # Add quadrant labels
+  annotate("text", x = 0.2, y = 0.7, label = "Possession/Slot Specialists", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.2, label = "Deep Threats", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.7, label = "Balanced Receivers", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.2, y = 0.2, label = "Role Players", fontface = "bold", alpha = 0.7) +
+  # Customize the plot
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Finding Balanced Wide Receivers",
+       subtitle = "Players who excel in both possession receiving and deep threat abilities",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       size = "Balance Score",
+       color = "Combined Score") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# Similarity Analysis - find players similar to other players
+# Function to calculate similarity between two players
+calculate_similarity <- function(player1_row, player2_row) {
+  # Calculate distance based on cluster membership values
+  dist <- sqrt(
+    (player1_row$Cluster1 - player2_row$Cluster1)^2 +
+    (player1_row$Cluster2 - player2_row$Cluster2)^2 +
+    (player1_row$Cluster3 - player2_row$Cluster3)^2
+  )
+  
+  # Convert distance to similarity score (higher is more similar)
+  similarity <- 1 / (1 + dist)
+  
+  return(similarity)
+}
+
+# Find similar players to a benchmark player
+find_similar_players <- function(target_player, player_data, n_similar = 5, exclude_list = NULL) {
+  # Find the target player row(s)
+  target_rows <- player_data[player_data$Player == target_player, ]
+  
+  if (nrow(target_rows) == 0) {
+    cat("Player not found:", target_player, "\n")
+    return(data.frame())
+  }
+  
+  # For multiple seasons of the same player, use the most recent one
+  if (nrow(target_rows) > 1) {
+    # Sort by Season (assuming higher numbers are more recent)
+    target_rows <- target_rows[order(target_rows$Season, decreasing = TRUE), ][1, ]
+  }
+  
+  # Calculate similarity for all other players
+  similarities <- data.frame()
+  
+  for (i in 1:nrow(player_data)) {
+    # Skip if same player or in exclude list
+    if (player_data$Player[i] == target_player || 
+        player_data$Player[i] %in% exclude_list) {
+      next
+    }
+    
+    # Calculate similarity score
+    sim_score <- calculate_similarity(target_rows, player_data[i, ])
+    
+    # Add to results
+    similarities <- rbind(similarities, data.frame(
+      TargetPlayer = target_player,
+      TargetTeam = target_rows$Team,
+      TargetSeason = target_rows$Season,
+      SimilarPlayer = player_data$Player[i],
+      SimilarTeam = player_data$Team[i],
+      SimilarSeason = player_data$Season[i],
+      SimilarityScore = sim_score,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Sort by similarity score (descending) and return top n
+  if (nrow(similarities) > 0) {
+    similarities <- similarities[order(similarities$SimilarityScore, decreasing = TRUE), ]
+    return(head(similarities, n_similar))
+  } else {
+    return(data.frame())
+  }
+}
+
+# Get similarity analysis for benchmark players
+# Select a few archetypal receivers to use as benchmarks
+benchmark_wrs <- c(
+  # Select top receiver from each cluster (will need to be updated with actual results)
+  "Justin Jefferson",
+  "Cooper Kupp", 
+  "Tyreek Hill",
+  "Stefon Diggs",
+  "CeeDee Lamb"
+)
+
+# Run similarity analysis for each benchmark player
+all_similarities <- data.frame()
+
+cat("\nFinding similar players for each benchmark receiver:\n")
+for (player in benchmark_wrs) {
+  cat("Processing:", player, "\n")
+  
+  # Find similar players
+  player_similarities <- find_similar_players(
+    target_player = player,
+    player_data = player_clusters,
+    n_similar = 5,
+    exclude_list = benchmark_wrs  # Exclude other benchmark players
+  )
+  
+  if (nrow(player_similarities) > 0) {
+    all_similarities <- rbind(all_similarities, player_similarities)
+  }
+}
+
+# Print the results
+cat("\nMost similar WRs to benchmark players:\n\n")
+unique_targets <- unique(all_similarities$TargetPlayer)
+for (player in unique_targets) {
+  player_results <- all_similarities[all_similarities$TargetPlayer == player, ]
+  
+  cat("Players most similar to", player, ":\n")
+  for (i in 1:nrow(player_results)) {
+    cat(sprintf("%d. %s (%s, %s) - Similarity: %.2f\n", 
+              i, 
+              player_results$SimilarPlayer[i], 
+              player_results$SimilarTeam[i],
+              player_results$SimilarSeason[i],
+              player_results$SimilarityScore[i] * 10))  # Scale up for readability
+  }
+  cat("\n")
+}
+
+# Export the results to CSV
+write.csv(all_similarities, "wr_similarity_analysis.csv", row.names = FALSE)
+
+# Analyze Style Evolution Across Seasons
+# Group players by name to analyze how their playing style has evolved
+player_seasons <- player_clusters %>%
+  group_by(Player) %>%
+  filter(n() > 1) %>%  # Only players with multiple seasons
+  arrange(Player, Season)
+
+# Find players who shifted their playing style across seasons
+style_evolution <- player_seasons %>%
+  summarize(
+    NumSeasons = n(),
+    PrimaryStyleChanged = length(unique(PrimaryCluster)) > 1,
+    Cluster1Change = max(Cluster1) - min(Cluster1),
+    Cluster2Change = max(Cluster2) - min(Cluster2),
+    Cluster3Change = max(Cluster3) - min(Cluster3),
+    TotalChange = abs(Cluster1Change) + abs(Cluster2Change) + abs(Cluster3Change)
+  ) %>%
+  arrange(desc(TotalChange))
+
+# Print players with the most significant style evolution
+cat("\nWide Receivers with Most Significant Style Evolution:\n")
+print(head(style_evolution, 10))
+
+# Visualize the style evolution for select players
+top_evolvers <- head(style_evolution$Player, 5)
+evolution_data <- player_clusters %>%
+  filter(Player %in% top_evolvers)
+
+# Create a scatter plot showing style evolution
+ggplot(evolution_data, aes(x = Cluster2, y = Cluster1, color = as.factor(Season))) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_path(aes(group = Player), arrow = arrow(length = unit(0.3, "cm"), type = "closed")) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), size = 3, max.overlaps = 20) +
+  facet_wrap(~ Player) +
+  theme_minimal() +
+  labs(title = "Wide Receiver Style Evolution Across Seasons",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       color = "Season") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Create detailed evolution view for selected interesting players
+interesting_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp", "CeeDee Lamb", "Davante Adams")
+player_evolution <- player_clusters %>%
+  filter(Player %in% interesting_players) %>%
+  arrange(Player, Season)
+
+# Print detailed style evolution for these players
+cat("\nDetailed Style Evolution for Selected Players:\n")
+for (player_name in interesting_players) {
+  player_data <- player_evolution %>% filter(Player == player_name)
+  
+  if (nrow(player_data) > 0) {
+    cat("\n", player_name, "Style Evolution:\n")
+    for (i in 1:nrow(player_data)) {
+      cat(sprintf("  %s (%s): Cluster1=%.2f, Cluster2=%.2f, Cluster3=%.2f, Primary=%s\n",
+                player_data$Season[i],
+                player_data$Team[i],
+                player_data$Cluster1[i],
+                player_data$Cluster2[i],
+                player_data$Cluster3[i],
+                cluster_names[player_data$PrimaryCluster[i]]))
+    }
+  }
+}
+
+# Visualize these interesting players' evolution
+ggplot(player_evolution, aes(x = Season, y = Cluster1, group = Player, color = Player)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = Team), size = 3, max.overlaps = 10) +
+  theme_minimal() +
+  labs(title = "Evolution of Possession/Slot Receiver Profile",
+       y = "Cluster 1 Membership",
+       x = "Season") +
+  theme(legend.position = "right")
+
+# Repeat for other clusters
+ggplot(player_evolution, aes(x = Season, y = Cluster2, group = Player, color = Player)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = Team), size = 3, max.overlaps = 10) +
+  theme_minimal() +
+  labs(title = "Evolution of Deep Threat Profile",
+       y = "Cluster 2 Membership",
+       x = "Season") +
+  theme(legend.position = "right")
+
+ggplot(player_evolution, aes(x = Season, y = Cluster3, group = Player, color = Player)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = Team), size = 3, max.overlaps = 10) +
+  theme_minimal() +
+  labs(title = "Evolution of Balanced/Do-it-all Profile",
+       y = "Cluster 3 Membership",
+       x = "Season") +
+  theme(legend.position = "right")
+
+# Create a 3D-like representation of player positioning in the style space
+pca_subset <- pca_coords_wr %>%
+  filter(player %in% c(interesting_players, head(balanced_wrs$Player, 5)))
+
+# Enhanced visualization
+ggplot(pca_subset, aes(x = PC1, y = PC2, color = player)) +
+  geom_point(size = 5, alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(player, " (", season, ")")), size = 3, max.overlaps = 20) +
+  theme_minimal() +
+  labs(title = "WR Style Positioning in 2D Space",
+       subtitle = "Elite Receivers and Top Hidden Gems",
+       x = "Style Dimension 1", 
+       y = "Style Dimension 2") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+```
+
+
+
+```{r}
+# ===============================================================
+# POST-PROCESSING SCRIPT FOR WR CLUSTERING ANALYSIS
+# Run this after your main model has already completed
+# ===============================================================
+
+# ASSUMING the following objects are already available from your main run:
+# - player_clusters: data frame with cluster memberships
+# - wr_metrics: data frame with WR performance metrics
+# - star_wrs: list of star WR names to exclude from analysis
+
+# If star_wrs is not defined, create it here
+if(!exists("star_wrs")) {
+  star_wrs <- c(
+    "Tyreek Hill", "Justin Jefferson", "Davante Adams", "Cooper Kupp", 
+    "Stefon Diggs", "Ja'Marr Chase", "CeeDee Lamb",
+    "DK Metcalf", "Mike Evans", "A.J. Brown", 
+    "Keenan Allen", "Amon-Ra St. Brown", "Terry McLaurin",
+    "Garrett Wilson", "Drake London"
+  )
+}
+
+# 1. IMPROVED BALANCE SCORE CALCULATION
+# ====================================
+
+# Create data frame for non-star players
+hidden_gems_candidates <- player_clusters %>%
+  filter(!Player %in% star_wrs)
+
+# Calculate improved balance scores
+hidden_gems_candidates <- hidden_gems_candidates %>%
+  mutate(
+    # Minimum-based score: minimum cluster membership × 3 (ensures all dimensions have meaningful values)
+    min_balance_score = pmin(Cluster1, Cluster2, Cluster3) * 3,
+    
+    # Geometric mean: (product of all values)^(1/number of values)
+    geometric_mean_score = (Cluster1 * Cluster2 * Cluster3)^(1/3),
+    
+    # Entropy-based score: -sum(p*log(p)) normalized to 0-1 scale
+    # Higher entropy = more balanced distribution
+    entropy_score = -((Cluster1 * log(Cluster1)) + 
+                      (Cluster2 * log(Cluster2)) + 
+                      (Cluster3 * log(Cluster3))) / log(3),
+    
+    # Distribution score: 1 - (max - min) - rewards even distribution across clusters
+    distribution_score = 1 - (max(Cluster1, Cluster2, Cluster3) - min(Cluster1, Cluster2, Cluster3)),
+    
+    # Variance-based score: 1 - variance of membership scores
+    # Lower variance = more balanced distribution
+    variance_score = 1 - (((Cluster1 - 1/3)^2 + (Cluster2 - 1/3)^2 + (Cluster3 - 1/3)^2) / 3),
+    
+    # Combined score (average of methods)
+    combined_balance_score = (min_balance_score + geometric_mean_score + entropy_score + 
+                             distribution_score + variance_score) / 5,
+                             
+    # Also add the receiving_playmaking_sum metric
+    receiving_playmaking_sum = Cluster1 + Cluster3
+  )
+
+# Find WRs with meaningful membership in multiple clusters
+balanced_wrs <- hidden_gems_candidates %>%
+  # Filter for players with balanced abilities
+  filter(Cluster1 > 0.25 & Cluster2 > 0.25 | 
+         Cluster1 > 0.25 & Cluster3 > 0.25 | 
+         Cluster2 > 0.25 & Cluster3 > 0.25) %>%
+  # Sort by the new combined balance score
+  arrange(desc(combined_balance_score)) %>%
+  # Take top 15 for visualization
+  head(15)
+
+# Print the top balanced WRs with the new balance scores
+print("Top Balanced WRs (Strong in multiple skill areas):")
+print(balanced_wrs[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "combined_balance_score")])
+
+# Add original metrics for these players for additional context
+balanced_wr_metrics <- balanced_wrs %>%
+  left_join(wr_metrics %>% select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R),
+            by = c("Player", "Team", "Season"))
+
+# Print the balanced WRs with their performance metrics
+print("Top Hidden Gems with Performance Metrics:")
+print(balanced_wr_metrics %>% 
+        select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R, combined_balance_score) %>% 
+        arrange(desc(combined_balance_score)))
+
+# Calculate specific skill combinations using the geometric mean (more intuitive)
+balanced_wr_metrics <- balanced_wr_metrics %>%
+  mutate(
+    # Possession + Deep score (possession receiver who can stretch the field)
+    possession_deep_score = (Cluster1 * Cluster2)^(1/2),  # Geometric mean of two scores
+    
+    # Possession + Balanced score (reliable possession receiver with all-around skills)
+    possession_balanced_score = (Cluster1 * Cluster3)^(1/2),
+    
+    # Deep + Balanced score (big-play threat with all-around capabilities)
+    deep_balanced_score = (Cluster2 * Cluster3)^(1/2)
+  )
+
+# 2. SIMILARITY ANALYSIS WITH STAR PLAYERS EXCLUDED
+# ===============================================
+
+# Function to calculate similarity between two players
+calculate_similarity <- function(player1_row, player2_row) {
+  # Calculate distance based on cluster membership values
+  dist <- sqrt(
+    (player1_row$Cluster1 - player2_row$Cluster1)^2 +
+    (player1_row$Cluster2 - player2_row$Cluster2)^2 +
+    (player1_row$Cluster3 - player2_row$Cluster3)^2
+  )
+  
+  # Convert distance to similarity score (higher is more similar)
+  similarity <- 1 / (1 + dist)
+  
+  return(similarity)
+}
+
+# Function to find similar players to a benchmark player while excluding star players
+find_similar_players_no_stars <- function(target_player, player_data, n_similar = 5, exclude_list = NULL) {
+  # Find the target player row(s)
+  target_rows <- player_data[player_data$Player == target_player, ]
+  
+  if (nrow(target_rows) == 0) {
+    cat("Player not found:", target_player, "\n")
+    return(data.frame())
+  }
+  
+  # For multiple seasons of the same player, use the most recent one
+  if (nrow(target_rows) > 1) {
+    # Sort by Season (assuming higher numbers are more recent)
+    target_rows <- target_rows[order(target_rows$Season, decreasing = TRUE), ][1, ]
+  }
+  
+  # Calculate similarity for all other players
+  similarities <- data.frame()
+  
+  for (i in 1:nrow(player_data)) {
+    # Skip if same player or in exclude list or is a star WR
+    if (player_data$Player[i] == target_player || 
+        player_data$Player[i] %in% exclude_list ||
+        player_data$Player[i] %in% star_wrs) {
+      next
+    }
+    
+    # Calculate similarity score
+    sim_score <- calculate_similarity(target_rows, player_data[i, ])
+    
+    # Add to results
+    similarities <- rbind(similarities, data.frame(
+      TargetPlayer = target_player,
+      TargetTeam = target_rows$Team,
+      TargetSeason = target_rows$Season,
+      SimilarPlayer = player_data$Player[i],
+      SimilarTeam = player_data$Team[i],
+      SimilarSeason = player_data$Season[i],
+      SimilarityScore = sim_score,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Sort by similarity score (descending) and return top n
+  if (nrow(similarities) > 0) {
+    similarities <- similarities[order(similarities$SimilarityScore, decreasing = TRUE), ]
+    return(head(similarities, n_similar))
+  } else {
+    return(data.frame())
+  }
+}
+
+# Get similarity analysis for benchmark players
+# Select a few archetypal receivers to use as benchmarks
+benchmark_wrs <- c(
+  "Justin Jefferson",
+  "Cooper Kupp", 
+  "Tyreek Hill",
+  "Stefon Diggs",
+  "CeeDee Lamb"
+)
+
+# Run similarity analysis for each benchmark player
+all_similarities <- data.frame()
+
+cat("\nFinding similar players for each benchmark receiver (excluding stars):\n")
+for (player in benchmark_wrs) {
+  cat("Processing:", player, "\n")
+  
+  # Find similar players
+  player_similarities <- find_similar_players_no_stars(
+    target_player = player,
+    player_data = player_clusters,
+    n_similar = 5,
+    exclude_list = benchmark_wrs  # Exclude other benchmark players
+  )
+  
+  if (nrow(player_similarities) > 0) {
+    all_similarities <- rbind(all_similarities, player_similarities)
+  }
+}
+
+# Print the results
+cat("\nMost similar WRs to benchmark players (non-star players only):\n\n")
+unique_targets <- unique(all_similarities$TargetPlayer)
+for (player in unique_targets) {
+  player_results <- all_similarities[all_similarities$TargetPlayer == player, ]
+  
+  cat("Players most similar to", player, ":\n")
+  for (i in 1:nrow(player_results)) {
+    cat(sprintf("%d. %s (%s, %s) - Similarity: %.2f\n", 
+              i, 
+              player_results$SimilarPlayer[i], 
+              player_results$SimilarTeam[i],
+              player_results$SimilarSeason[i],
+              player_results$SimilarityScore[i] * 10))  # Scale up for readability
+  }
+  cat("\n")
+}
+
+# 3. UPDATED HIDDEN GEMS VISUALIZATION
+# ==================================
+
+# Create visualization using the improved balance scores
+hidden_gems_plot <- ggplot(player_clusters, aes(x = Cluster2, y = Cluster1)) +
+  # Add quadrant lines
+  geom_vline(xintercept = 0.33, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = 0.33, linetype = "dashed", color = "gray") +
+  # Plot all players as small points
+  geom_point(color = "gray", alpha = 0.3) +
+  # Highlight the balanced players
+  geom_point(data = balanced_wrs, aes(size = combined_balance_score, color = Cluster3), alpha = 0.8) +
+  # Add labels to the top balanced players
+  geom_text_repel(data = head(balanced_wrs, 10), 
+                  aes(label = paste0(Player, " (", Season, ")")), 
+                  size = 3, 
+                  nudge_y = 0.03,
+                  max.overlaps = 10) +
+  # Add quadrant labels
+  annotate("text", x = 0.2, y = 0.7, label = "Possession/Slot Specialists", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.2, label = "Deep Threats", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.7, label = "Balanced Receivers", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.2, y = 0.2, label = "Role Players", fontface = "bold", alpha = 0.7) +
+  # Customize the plot
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Finding Balanced Wide Receivers",
+       subtitle = "Players who excel in both possession receiving and deep threat abilities",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       size = "Balance Score",
+       color = "Balanced/Elite Ability") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# Display the plot
+print(hidden_gems_plot)
+
+# Save updated results
+write.csv(balanced_wr_metrics, "wr_hidden_gems_updated.csv", row.names = FALSE)
+write.csv(all_similarities, "wr_similarity_analysis_no_stars.csv", row.names = FALSE)
+
+# End of post-processing script
+```
+
+
+```{r}
+# ===============================================================
+# HIDDEN GEMS VISUALIZATION CHARTS
+# Run this after your main model and the balance score updates
+# ===============================================================
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(viridis)
+
+# Create specialized hidden gems visualizations for different player types
+
+# 1. Hidden Gems - Possession Receivers with Deep Threat Ability
+possession_deep_gems <- balanced_wr_metrics %>%
+  filter(Cluster1 > 0.3 & Cluster2 > 0.3) %>%
+  arrange(desc(possession_deep_score)) %>%
+  head(10)
+
+possession_deep_plot <- ggplot(possession_deep_gems, aes(x = AvgDepthTarget, y = Ctch_pct)) +
+  geom_point(aes(size = possession_deep_score, color = RecYds), alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), 
+                 size = 3, max.overlaps = 10) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Hidden Gems: Possession Receivers with Deep Threat Ability",
+       subtitle = "Players who combine reliable hands with the ability to stretch the field",
+       x = "Average Target Depth (yards)",
+       y = "Catch Percentage",
+       size = "Possession-Deep Score",
+       color = "Receiving Yards") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(possession_deep_plot)
+
+# 2. Hidden Gems - Deep Threats with All-Around Skills
+deep_balanced_gems <- balanced_wr_metrics %>%
+  filter(Cluster2 > 0.3 & Cluster3 > 0.25) %>%
+  arrange(desc(deep_balanced_score)) %>%
+  head(10)
+
+deep_balanced_plot <- ggplot(deep_balanced_gems, aes(x = YAC_R, y = AvgDepthTarget)) +
+  geom_point(aes(size = deep_balanced_score, color = RECTD), alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), 
+                 size = 3, max.overlaps = 10) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Hidden Gems: Deep Threats with All-Around Skills",
+       subtitle = "Big-play receivers who also contribute in other aspects of the game",
+       x = "Yards After Catch per Reception",
+       y = "Average Target Depth (yards)",
+       size = "Deep-Balanced Score",
+       color = "Receiving TDs") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(deep_balanced_plot)
+
+# 3. Hidden Gems - True Versatile Receivers
+versatile_gems <- balanced_wr_metrics %>%
+  filter(Cluster1 > 0.2 & Cluster2 > 0.2 & Cluster3 > 0.2) %>%
+  arrange(desc(combined_balance_score)) %>%
+  head(10)
+
+versatile_plot <- ggplot(versatile_gems, aes(x = Cluster2, y = Cluster1)) +
+  geom_point(aes(size = Cluster3, color = RecYds), alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), 
+                 size = 3, max.overlaps = 10) +
+  scale_size_continuous(name = "Balanced/Elite\nAbility", range = c(3, 10)) +
+  scale_color_viridis_c(option = "viridis") +
+  theme_minimal() +
+  labs(title = "Hidden Gems: True Versatile Receivers",
+       subtitle = "Players who show meaningful membership in all three receiver profiles",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       color = "Receiving Yards") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(versatile_plot)
+
+# 4. Alternative visualizations: Performance Metrics
+# Create a plot comparing catch rate vs production for balanced receivers
+catch_yards_plot <- ggplot(balanced_wr_metrics, aes(x = RecYds, y = Ctch_pct)) +
+  geom_point(aes(size = combined_balance_score, color = AvgDepthTarget), alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), 
+                 size = 3, max.overlaps = 10) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Hidden Gems: Balancing Efficiency and Production",
+       subtitle = "Receivers who maintain high catch rates while producing significant yardage",
+       x = "Receiving Yards",
+       y = "Catch Percentage",
+       size = "Balance Score",
+       color = "Avg Target Depth") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(catch_yards_plot)
+
+# 5. Efficiency visualization: YAC Specialists who also have deep roles
+yac_depth_plot <- ggplot(balanced_wr_metrics, aes(x = AvgDepthTarget, y = YAC_R)) +
+  geom_point(aes(size = combined_balance_score, color = RecYds), alpha = 0.8) +
+  geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), 
+                 size = 3, max.overlaps = 10) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Hidden Gems: YAC Specialists with Deep Roles",
+       subtitle = "Players who generate yards after catch despite being targeted deeper downfield",
+       x = "Average Target Depth (yards)",
+       y = "Yards After Catch per Reception",
+       size = "Balance Score",
+       color = "Receiving Yards") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+print(yac_depth_plot)
+
+# Save the plots if needed
+ggsave("wr_possession_deep_gems.png", possession_deep_plot, width = 10, height = 7)
+ggsave("wr_deep_balanced_gems.png", deep_balanced_plot, width = 10, height = 7)
+ggsave("wr_versatile_gems.png", versatile_plot, width = 10, height = 7)
+ggsave("wr_catch_yards_gems.png", catch_yards_plot, width = 10, height = 7)
+ggsave("wr_yac_depth_gems.png", yac_depth_plot, width = 10, height = 7)
+
+```
+
+```{r}
+# Minimal Shiny app for WR Clustering Analysis
+library(shiny)
+library(shinydashboard)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(viridis)
+library(DT)
+
+# Define UI
+ui <- dashboardPage(
+  dashboardHeader(title = "WR Clustering"),
+  
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Hidden Gems", tabName = "hidden_gems", icon = icon("gem")),
+      menuItem("Similarity", tabName = "similarity", icon = icon("users"))
+    )
+  ),
+  
+  dashboardBody(
+    tabItems(
+      # Hidden Gems Tab
+      tabItem(tabName = "hidden_gems",
+        fluidRow(
+          box(width = 3,
+            title = "Hidden Gems Filters",
+            sliderInput("min_balance_score", "Min Balance Score:",
+                       min = 0.3, max = 0.9, value = 0.5, step = 0.05),
+            checkboxGroupInput("seasons_filter", "Seasons:",
+                              choices = c("2020", "2021", "2022", "2023", "2024"),
+                              selected = c("2020", "2021", "2022", "2023", "2024"))
+          ),
+          box(width = 9,
+            title = "Hidden Gems Visualization",
+            plotlyOutput("hidden_gems_plot", height = "500px")
+          )
+        ),
+        fluidRow(
+          box(width = 12,
+            title = "Hidden Gems Details",
+            DTOutput("hidden_gems_table")
+          )
+        )
+      ),
+      
+      # Similarity Analysis Tab
+      tabItem(tabName = "similarity",
+        fluidRow(
+          box(width = 3,
+            title = "Benchmark Player",
+            selectInput("benchmark_player", "Select Player:",
+                      choices = c("Justin Jefferson", "Cooper Kupp", "Tyreek Hill")),
+            checkboxInput("exclude_stars", "Exclude Star Players", value = TRUE)
+          ),
+          box(width = 9,
+            title = "Similar Players",
+            plotlyOutput("similarity_plot", height = "500px")
+          )
+        ),
+        fluidRow(
+          box(width = 12,
+            title = "Similar Players Details",
+            DTOutput("similarity_table")
+          )
+        )
+      )
+    )
+  )
+)
+
+# Define server logic
+server <- function(input, output) {
+  # Create mock data for demonstration
+  mock_data <- reactive({
+    # Create sample players
+    players <- c("Justin Jefferson", "Cooper Kupp", "CeeDee Lamb", "Tyreek Hill", 
+                "Jakobi Meyers", "Allen Lazard", "Tyler Boyd", "Russell Gage", "Michael Gallup")
+    teams <- c("MIN", "LAR", "DAL", "MIA", "NWE", "GNB", "CIN", "ATL", "DAL")
+    n_players <- length(players)
+    
+    # Generate cluster memberships
+    set.seed(123)
+    cluster1 <- round(runif(n_players, 0.1, 0.9), 2)
+    cluster2 <- round(runif(n_players, 0.1, 0.9), 2)
+    # Adjust so they sum to < 1
+    cluster1 <- cluster1 / (cluster1 + cluster2) * 0.8
+    cluster2 <- cluster2 / (cluster1 + cluster2) * 0.8
+    cluster3 <- round(1 - cluster1 - cluster2, 2)
+    
+    # Performance metrics
+    tgt <- c(184, 145, 156, 170, 96, 100, 98, 87, 102)
+    rec <- c(128, 110, 109, 119, 67, 60, 58, 53, 43)
+    yards <- c(1809, 1485, 1359, 1710, 738, 788, 762, 770, 418)
+    tds <- c(8, 12, 8, 7, 2, 6, 5, 4, 2)
+    catch_pct <- c(70, 76, 70, 70, 70, 60, 59, 61, 42)
+    depth <- c(10.1, 6.8, 8.9, 12.2, 9.6, 11.0, 9.7, 12.3, 14.5)
+    yac <- c(4.9, 5.5, 4.1, 4.1, 4.5, 2.8, 3.9, 5.2, 2.1)
+    
+    # Combined data frame
+    player_data <- data.frame(
+      Player = players,
+      Team = teams,
+      Season = rep(2022, n_players),
+      Cluster1 = cluster1,
+      Cluster2 = cluster2,
+      Cluster3 = cluster3,
+      Tgt = tgt,
+      Rec = rec,
+      RecYds = yards,
+      RECTD = tds,
+      Ctch_pct = catch_pct,
+      AvgDepthTarget = depth,
+      YAC_R = yac,
+      stringsAsFactors = FALSE
+    )
+    
+    # Add balance scores
+    player_data$min_balance_score <- pmin(player_data$Cluster1, 
+                                         player_data$Cluster2, 
+                                         player_data$Cluster3) * 3
+    
+    player_data$combined_balance_score <- (player_data$Cluster1 * 
+                                         player_data$Cluster2 * 
+                                         player_data$Cluster3)^(1/3)
+    
+    # Create star WRs list
+    star_wrs <- c("Justin Jefferson", "Cooper Kupp", "CeeDee Lamb", "Tyreek Hill")
+    
+    # Return list with all data
+    list(
+      player_data = player_data,
+      star_wrs = star_wrs
+    )
+  })
+  
+  # Hidden Gems Plot
+  output$hidden_gems_plot <- renderPlotly({
+    data <- mock_data()
+    
+    # Filter non-star players
+    gems <- data$player_data[!data$player_data$Player %in% data$star_wrs, ]
+    gems <- gems[gems$combined_balance_score >= input$min_balance_score, ]
+    
+    # Create hover text
+    gems$hover_text <- with(gems, 
+                           paste0("<b>", Player, " (", Team, ")</b><br>",
+                                 "Yards: ", RecYds, "<br>",
+                                 "TDs: ", RECTD, "<br>",
+                                 "Catch %: ", Ctch_pct, "%<br>",
+                                 "Balance Score: ", round(combined_balance_score, 2)))
+    
+    # Create plot
+    p <- plot_ly(gems, x = ~Cluster2, y = ~Cluster1, 
+               text = ~hover_text, hoverinfo = "text",
+               color = ~Cluster3, size = ~combined_balance_score,
+               type = "scatter", mode = "markers",
+               marker = list(opacity = 0.8, sizeref = 0.1),
+               colors = viridis(10, option = "plasma")) %>%
+      layout(title = "Finding Balanced Wide Receivers",
+             xaxis = list(title = "Deep Threat Ability", range = c(0, 1)),
+             yaxis = list(title = "Possession/Slot Ability", range = c(0, 1)),
+             annotations = list(
+               list(x = 0.2, y = 0.7, text = "Possession Specialists", 
+                   showarrow = FALSE, font = list(size = 12)),
+               list(x = 0.7, y = 0.2, text = "Deep Threats", 
+                   showarrow = FALSE, font = list(size = 12)),
+               list(x = 0.7, y = 0.7, text = "Balanced Receivers", 
+                   showarrow = FALSE, font = list(size = 12))
+             ))
+    
+    p
+  })
+  
+  # Hidden Gems Table
+  output$hidden_gems_table <- renderDT({
+    data <- mock_data()
+    
+    # Filter non-star players
+    gems <- data$player_data[!data$player_data$Player %in% data$star_wrs, ]
+    gems <- gems[gems$combined_balance_score >= input$min_balance_score, ]
+    
+    # Format for display
+    result <- gems[, c("Player", "Team", "Season", "Tgt", "Rec", "RecYds", "RECTD", 
+                      "Ctch_pct", "AvgDepthTarget", "YAC_R", "combined_balance_score")]
+    
+    # Sort by balance score
+    result <- result[order(result$combined_balance_score, decreasing = TRUE), ]
+    
+    # Format columns
+    result$combined_balance_score <- round(result$combined_balance_score, 2)
+    
+    datatable(result, 
+             colnames = c("Player" = "Player", 
+                         "Team" = "Team", 
+                         "Season" = "Season",
+                         "Targets" = "Tgt", 
+                         "Receptions" = "Rec", 
+                         "Yards" = "RecYds", 
+                         "TDs" = "RECTD", 
+                         "Catch %" = "Ctch_pct", 
+                         "Avg Depth" = "AvgDepthTarget", 
+                         "YAC/Rec" = "YAC_R", 
+                         "Balance Score" = "combined_balance_score"),
+             options = list(pageLength = 10))
+  })
+  
+  # Similarity Plot
+  output$similarity_plot <- renderPlotly({
+    data <- mock_data()
+    
+    # Find benchmark player
+    benchmark <- data$player_data[data$player_data$Player == input$benchmark_player, ]
+    
+    # Calculate similarity scores
+    similarity_scores <- data.frame()
+    
+    for (i in 1:nrow(data$player_data)) {
+      player <- data$player_data[i, ]
+      
+      # Skip if same player or is a star WR (when exclude_stars is TRUE)
+      if (player$Player == benchmark$Player || 
+          (input$exclude_stars && player$Player %in% data$star_wrs)) {
+        next
+      }
+      
+      # Calculate distance in cluster space
+      dist <- sqrt(
+        (player$Cluster1 - benchmark$Cluster1)^2 +
+        (player$Cluster2 - benchmark$Cluster2)^2 +
+        (player$Cluster3 - benchmark$Cluster3)^2
+      )
+      
+      # Convert to similarity score
+      sim_score <- 1 / (1 + dist)
+      
+      # Add to results
+      similarity_scores <- rbind(similarity_scores, data.frame(
+        Player = player$Player,
+        Team = player$Team,
+        Season = player$Season,
+        Tgt = player$Tgt,
+        Rec = player$Rec,
+        RecYds = player$RecYds,
+        RECTD = player$RECTD,
+        Ctch_pct = player$Ctch_pct,
+        AvgDepthTarget = player$AvgDepthTarget,
+        YAC_R = player$YAC_R,
+        Cluster1 = player$Cluster1,
+        Cluster2 = player$Cluster2,
+        Cluster3 = player$Cluster3,
+        SimilarityScore = sim_score,
+        stringsAsFactors = FALSE
+      ))
+    }
+    
+    # Sort by similarity
+    similarity_scores <- similarity_scores[order(similarity_scores$SimilarityScore, decreasing = TRUE), ]
+    
+    # Create hover text
+    similarity_scores$hover_text <- with(similarity_scores, 
+                                        paste0("<b>", Player, " (", Team, ")</b><br>",
+                                             "Similarity: ", round(SimilarityScore * 10, 1), "<br>",
+                                             "Yards: ", RecYds, "<br>",
+                                             "TDs: ", RECTD))
+    
+    # Create plot
+    p <- plot_ly(similarity_scores, x = ~Cluster2, y = ~Cluster1, 
+               text = ~hover_text, hoverinfo = "text",
+               color = ~SimilarityScore, size = ~SimilarityScore * 20,
+               type = "scatter", mode = "markers",
+               marker = list(opacity = 0.8, sizeref = 0.1),
+               colors = viridis(10)) %>%
+      layout(title = paste("Players Similar to", benchmark$Player),
+             xaxis = list(title = "Deep Threat Ability", range = c(0, 1)),
+             yaxis = list(title = "Possession/Slot Ability", range = c(0, 1)))
+    
+    # Add benchmark player as reference
+    p <- add_trace(p, x = benchmark$Cluster2, y = benchmark$Cluster1,
+                  type = "scatter", mode = "markers",
+                  marker = list(size = 15, color = 'red', symbol = 'diamond'),
+                  name = "Benchmark",
+                  text = paste("Benchmark:", benchmark$Player),
+                  hoverinfo = "text")
+    
+    p
+  })
+  
+  # Similarity Table
+  output$similarity_table <- renderDT({
+    data <- mock_data()
+    
+    # Find benchmark player
+    benchmark <- data$player_data[data$player_data$Player == input$benchmark_player, ]
+    
+    # Calculate similarity scores
+    similarity_scores <- data.frame()
+    
+    for (i in 1:nrow(data$player_data)) {
+      player <- data$player_data[i, ]
+      
+      # Skip if same player or is a star WR (when exclude_stars is TRUE)
+      if (player$Player == benchmark$Player || 
+          (input$exclude_stars && player$Player %in% data$star_wrs)) {
+        next
+      }
+      
+      # Calculate distance in cluster space
+      dist <- sqrt(
+        (player$Cluster1 - benchmark$Cluster1)^2 +
+        (player$Cluster2 - benchmark$Cluster2)^2 +
+        (player$Cluster3 - benchmark$Cluster3)^2
+      )
+      
+      # Convert to similarity score
+      sim_score <- 1 / (1 + dist)
+      
+      # Add to results
+      similarity_scores <- rbind(similarity_scores, data.frame(
+        Player = player$Player,
+        Team = player$Team,
+        Similarity = round(sim_score * 10, 1),
+        Tgt = player$Tgt,
+        Rec = player$Rec,
+        RecYds = player$RecYds,
+        RECTD = player$RECTD,
+        Ctch_pct = player$Ctch_pct,
+        AvgDepthTarget = player$AvgDepthTarget,
+        YAC_R = player$YAC_R,
+        stringsAsFactors = FALSE
+      ))
+    }
+    
+    # Sort by similarity
+    similarity_scores <- similarity_scores[order(similarity_scores$Similarity, decreasing = TRUE), ]
+    
+    datatable(similarity_scores,
+             options = list(pageLength = 10))
+  })
+}
+
+# Run the application
+shinyApp(ui = ui, server = server)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# -----------------------------------------------
+# Wide Receiver Clustering with Partial Membership Models
+# Revised for Numerical Stability
+# -----------------------------------------------
+
+# Load required packages
+library(nimble)
+library(label.switching)
+library(tidyverse)
+library(MCMCpack)  # For Dirichlet distribution
+library(fmsb)      # For radar charts
+library(viridis)   # For better color palettes
+library(ggrepel)   # For better text labels in plots
+library(corrplot)  # For correlation visualization
+
+# Setting up the working directory - modify as needed
+# setwd("YOUR/DIRECTORY/PATH")
+
+# Ensure plots will be saved
+options(device = "RStudioGD")
+
+# Read the wide receiver data
+# Note: skip = 1 to skip the header row
+wr_data <- read.csv("WR Stats all.csv", skip = 1) 
+
+# Print dimensions for verification
+print(dim(wr_data))
+
+# Rename the columns for better usability
+colnames(wr_data) <- c("Rank", "Player", "Tgt_raw", "Season", "Age", "Team", 
+                     "Games", "GS", "Tgt", "Rec", "RecYds", "Y_Rec", "RECTD", 
+                     "RecY_G", "Ctch_pct", "Yard_Tgt", "Rec1D", "RecSucc_pct", 
+                     "AirYards", "AirY_Rec", "YAC", "YAC_R", "AvgDepthTarget",
+                     "RecBrkTkl", "Rec_Br", "Drop", "Drop_pct", "Int", "PasserRating")
+
+# Display the first few rows to verify
+print(head(wr_data))
+
+# Function to prepare WR data for clustering
+prepare_wr_data <- function(data) {
+  # Create a data frame with our selected columns
+  wr_metrics <- data.frame(
+    Player = data$Player,
+    Team = data$Team,
+    Season = data$Season,
+    
+    # Key performance metrics for wide receivers
+    Tgt = as.numeric(as.character(data$Tgt)),               # Targets
+    Rec = as.numeric(as.character(data$Rec)),               # Receptions
+    RecYds = as.numeric(as.character(data$RecYds)),         # Receiving Yards
+    RECTD = as.numeric(as.character(data$RECTD)),           # Receiving TDs
+    Ctch_pct = as.numeric(as.character(data$Ctch_pct)),     # Catch Percentage
+    Yard_Tgt = as.numeric(as.character(data$Yard_Tgt)),     # Yards per Target
+    Rec1D = as.numeric(as.character(data$Rec1D)),           # First Downs
+    RecSucc_pct = as.numeric(as.character(data$RecSucc_pct)), # Success Rate
+    AirYards = as.numeric(as.character(data$AirYards)),     # Air Yards
+    AirY_Rec = as.numeric(as.character(data$AirY_Rec)),     # Air Yards per Reception
+    YAC = as.numeric(as.character(data$YAC)),               # Yards After Catch
+    YAC_R = as.numeric(as.character(data$YAC_R)),           # YAC per Reception
+    AvgDepthTarget = as.numeric(as.character(data$AvgDepthTarget)), # Avg Depth of Target
+    RecBrkTkl = as.numeric(as.character(data$RecBrkTkl)),   # Broken Tackles
+    Drop_pct = as.numeric(as.character(data$Drop_pct))      # Drop Percentage
+  )
+  
+  # Show a preview
+  print(head(wr_metrics))
+  
+  # Filter out rows with missing values or invalid data
+  wr_metrics <- wr_metrics %>%
+    filter(!is.na(Tgt) & 
+           !is.na(Rec) &
+           !is.na(RecYds) &
+           !is.na(RECTD))
+  
+  # Create standardized versions of the metrics
+  wr_metrics$scaled_Tgt <- scale(wr_metrics$Tgt)
+  wr_metrics$scaled_Rec <- scale(wr_metrics$Rec)
+  wr_metrics$scaled_RecYds <- scale(wr_metrics$RecYds)
+  wr_metrics$scaled_RECTD <- scale(wr_metrics$RECTD)
+  wr_metrics$scaled_Ctch_pct <- scale(wr_metrics$Ctch_pct)
+  wr_metrics$scaled_Yard_Tgt <- scale(wr_metrics$Yard_Tgt)
+  wr_metrics$scaled_Rec1D <- scale(wr_metrics$Rec1D)
+  wr_metrics$scaled_RecSucc_pct <- scale(wr_metrics$RecSucc_pct)
+  wr_metrics$scaled_AirYards <- scale(wr_metrics$AirYards)
+  wr_metrics$scaled_AirY_Rec <- scale(wr_metrics$AirY_Rec)
+  wr_metrics$scaled_YAC <- scale(wr_metrics$YAC)
+  wr_metrics$scaled_YAC_R <- scale(wr_metrics$YAC_R)
+  wr_metrics$scaled_AvgDepthTarget <- scale(wr_metrics$AvgDepthTarget)
+  wr_metrics$scaled_RecBrkTkl <- scale(wr_metrics$RecBrkTkl)
+  wr_metrics$scaled_Drop_pct <- scale(wr_metrics$Drop_pct)
+  
+  return(wr_metrics)
+}
+
+# Apply the data preparation function
+wr_metrics <- prepare_wr_data(wr_data)
+
+# Check the structure of the prepared data
+head(wr_metrics)
+summary(wr_metrics)
+
+# Check overdispersion in count data
+count_cols <- c("Tgt", "Rec", "RecYds", "RECTD", "Rec1D", "RecBrkTkl")
+overdispersion <- data.frame(
+  metric = count_cols,
+  mean = sapply(count_cols, function(col) mean(wr_metrics[[col]], na.rm = TRUE)),
+  variance = sapply(count_cols, function(col) var(wr_metrics[[col]], na.rm = TRUE))
+)
+overdispersion$ratio <- overdispersion$variance / overdispersion$mean
+print("Overdispersion analysis (variance/mean):")
+print(overdispersion)
+
+# Check correlations between metrics
+scaled_cols <- grep("^scaled_", names(wr_metrics), value = TRUE)
+cor_matrix <- cor(wr_metrics[, scaled_cols], use = "complete.obs")
+corrplot(cor_matrix, method = "circle")
+
+# -----------------------------------------------
+# Use a single distribution (Normal) for simplicity and stability
+# This is a more reliable approach than using multiple distributions
+# -----------------------------------------------
+
+# Now, define the partial membership model using Nimble
+wr_pm_code <- nimbleCode({
+  # Priors for mean parameters (cluster centers)
+  for(k in 1:K) {
+    for(j in 1:J) {
+      mu[k, j] ~ dnorm(0, 0.1)  # Prior for cluster means
+      sigma[k, j] ~ dunif(0.1, 2)  # Prior for standard deviation
+    }
+  }
+  
+  # Prior for Dirichlet parameter
+  delta ~ dunif(0, 10)  # Following the paper's approach
+  
+  # Create fixed vector for Dirichlet distribution
+  for(k in 1:K) {
+    delta_vec[k] <- delta  # Create a vector of identical delta values
+  }
+  
+  # For each player
+  for(i in 1:N) {
+    # Membership weights follow Dirichlet distribution
+    alpha[i, 1:K] ~ ddirch(delta_vec[1:K])  
+    
+    # For each performance stat
+    for(j in 1:J) {
+      # Calculate expected value for this player's jth stat
+      mu_ij[i, j] <- inprod(alpha[i, 1:K], mu[1:K, j])
+      
+      # Calculate variance
+      var_temp[i, j] <- inprod(alpha[i, 1:K], sigma[1:K, j]^2)
+      prec_ij[i, j] <- 1/var_temp[i, j]
+      
+      # Data likelihood
+      X[i, j] ~ dnorm(mu_ij[i, j], prec_ij[i, j])
+    }
+  }
+})
+
+# Extract the standardized matrix for modeling
+X_wr <- as.matrix(wr_metrics[, scaled_cols])
+
+# Set up constants
+N_wr <- nrow(X_wr)  # Number of players
+J_wr <- ncol(X_wr)  # Number of metrics
+
+# Run for different K values to find optimal number of clusters
+K_values <- 2:5
+waic_results_wr <- vector("list", length(K_values))
+
+for(i in 1:length(K_values)) {
+  K <- K_values[i]
+  
+  # Constants for the model
+  constants <- list(
+    N = N_wr,
+    J = J_wr,
+    K = K
+  )
+  
+  # Data for the model
+  data <- list(
+    X = X_wr
+  )
+  
+  # Initial values
+  inits <- list(
+    mu = matrix(rnorm(K*J_wr, 0, 0.1), K, J_wr),
+    sigma = matrix(runif(K*J_wr, 0.5, 1.5), K, J_wr),
+    alpha = matrix(rdirichlet(N_wr, rep(1, K)), N_wr, K),
+    delta = 1,
+    delta_vec = rep(1, K)
+  )
+  
+  # Build and compile the model
+  wr_model <- nimbleModel(wr_pm_code, constants = constants, data = data, inits = inits)
+  compiled_model <- compileNimble(wr_model)
+  
+  # Set up MCMC configuration
+  mcmc_conf <- configureMCMC(wr_model, monitors = c("mu", "sigma", "alpha", "delta"), enableWAIC = TRUE)
+  mcmc <- buildMCMC(mcmc_conf)
+  compiled_mcmc <- compileNimble(mcmc, project = wr_model)
+  
+  # Run the MCMC
+  cat("Running model with K =", K, "\n")
+  samples <- runMCMC(compiled_mcmc, 
+                   niter = 10000,      # Iterations
+                   nburnin = 2000,     # Burn-in period
+                   thin = 20,          # Thinning interval
+                   summary = TRUE,
+                   WAIC = TRUE)        # Calculate WAIC for model comparison
+  
+  # Extract WAIC value
+  waic_value <- as.numeric(samples$WAIC$WAIC)
+  
+  # Store results
+  waic_results_wr[[i]] <- list(
+    K = K,
+    WAIC = waic_value,
+    samples = samples
+  )
+  
+  cat("Completed. WAIC =", waic_value, "\n\n")
+}
+
+# Find optimal K
+waic_values_wr <- sapply(waic_results_wr, function(x) x$WAIC)
+optimal_K_wr <- K_values[which.min(waic_values_wr)]
+cat("Optimal number of clusters for WRs:", optimal_K_wr, "\n")
+
+# For stability in interpreting results, we'll use K=3 (or optimal K if it's different)
+# This helps avoid label switching issues and makes interpretation more intuitive
+K_wr <- 3  # Can replace with optimal_K_wr if different
+
+# Re-run the model with K=3 (or optimal K)
+cat("Re-running the model with K =", K_wr, "for consistency\n")
+
+# Extract samples from the K=3 run
+optimal_samples_wr <- waic_results_wr[[which(K_values == K_wr)]]$samples
+
+# Extract the relevant samples
+alpha_samples <- optimal_samples_wr$samples[, grep("alpha", colnames(optimal_samples_wr$samples))]
+mu_samples <- optimal_samples_wr$samples[, grep("mu", colnames(optimal_samples_wr$samples))]
+
+# Process the cluster centers directly (skip label switching)
+cat("Processing cluster results directly...\n")
+
+# Calculate mean alphas (membership weights)
+alpha_means <- matrix(0, nrow = N_wr, ncol = K_wr)
+colnames(alpha_means) <- paste0("Cluster", 1:K_wr)
+rownames(alpha_means) <- wr_metrics$Player
+
+for(i in 1:N_wr) {
+  for(k in 1:K_wr) {
+    alpha_means[i, k] <- mean(alpha_samples[, paste0("alpha[", i, ", ", k, "]")])
+  }
+}
+
+# Calculate mean mus (cluster centers)
+mu_means <- array(0, dim = c(K_wr, J_wr))
+colnames(mu_means) <- scaled_cols
+rownames(mu_means) <- paste0("Cluster", 1:K_wr)
+
+for(k in 1:K_wr) {
+  for(j in 1:J_wr) {
+    mu_means[k, j] <- mean(mu_samples[, paste0("mu[", k, ", ", j, "]")])
+  }
+}
+
+# Order clusters by size for consistency
+cluster_sizes <- colSums(alpha_means)
+print("Cluster sizes (sum of membership weights):")
+print(cluster_sizes)
+
+# Order indices
+order_idx <- order(cluster_sizes, decreasing = TRUE)
+
+# Reorder mu and alpha
+mean_mu_wr <- mu_means[order_idx, ]
+rownames(mean_mu_wr) <- paste0("Cluster", 1:K_wr)
+mean_alpha_wr <- alpha_means[, order_idx]
+colnames(mean_alpha_wr) <- paste0("Cluster", 1:K_wr)
+
+# Now continue with visualization and interpretation...
+# Create a data frame for cluster profiles
+wr_cluster_profiles <- as.data.frame(mean_mu_wr) %>%
+  rownames_to_column("Cluster") %>%
+  pivot_longer(-Cluster, names_to = "Metric", values_to = "Value")
+
+# Plot cluster profiles
+p1 <- ggplot(wr_cluster_profiles, aes(x = Metric, y = Value, color = Cluster, group = Cluster)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "WR Cluster Profiles", y = "Standardized Value")
+print(p1)
+ggsave("cluster_profiles.png", p1, width = 10, height = 6)
+
+# Create a data frame for archetypal players
+archetypal_wrs <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season,
+  mean_alpha_wr
+)
+
+# Find top players for each cluster
+for(k in 1:K_wr) {
+  cat("\nCluster", k, "archetypes:\n")
+  cluster_col <- paste0("Cluster", k)
+  top_players <- archetypal_wrs[order(archetypal_wrs[, cluster_col], decreasing = TRUE), ]
+  print(head(top_players[, c("Player", "Team", "Season", cluster_col)], 5))
+}
+
+# Create radar charts for each cluster
+# Convert back to unstandardized values for interpretation
+# Choose a subset of important metrics for better visualization
+key_metrics <- c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", 
+                "Yard_Tgt", "Rec1D", "AirY_Rec", "YAC_R", 
+                "AvgDepthTarget", "RecBrkTkl", "Drop_pct")
+
+# Map standardized to original metrics
+unstandardized_profiles <- matrix(0, nrow = K_wr, ncol = length(key_metrics))
+colnames(unstandardized_profiles) <- key_metrics
+
+for(j in 1:length(key_metrics)) {
+  col_name <- paste0("scaled_", key_metrics[j])
+  col_idx <- which(colnames(mean_mu_wr) == col_name)
+  
+  if(!is.na(col_idx)) {
+    idx_in_metrics <- which(colnames(wr_metrics) == key_metrics[j])
+    if(length(idx_in_metrics) > 0) {
+      sd_val <- sd(wr_metrics[, key_metrics[j]], na.rm = TRUE)
+      mean_val <- mean(wr_metrics[, key_metrics[j]], na.rm = TRUE)
+      unstandardized_profiles[, j] <- mean_mu_wr[, col_idx] * sd_val + mean_val
+    }
+  }
+}
+
+# For each cluster, create a radar chart
+for(k in 1:K_wr) {
+  cluster_data <- rbind(
+    apply(wr_metrics[, key_metrics], 2, max, na.rm = TRUE),
+    apply(wr_metrics[, key_metrics], 2, min, na.rm = TRUE),
+    unstandardized_profiles[k, ]
+  )
+  
+  # Create radar chart
+  radarchart(cluster_data, 
+             title = paste("Cluster", k, "Profile"),
+             pcol = viridis(1), 
+             pfcol = alpha(viridis(1), 0.5))
+}
+
+# Create pie charts for selected players
+# Choose some interesting players with mixed memberships
+
+# Find archetypal players for each cluster
+top_archetypal_players <- c()
+for(k in 1:K_wr) {
+  cluster_col <- paste0("Cluster", k)
+  top_archetypal_players <- c(top_archetypal_players, 
+                             archetypal_wrs$Player[which.max(archetypal_wrs[, cluster_col])])
+}
+
+# Also find players with more mixed memberships
+mixed_players <- archetypal_wrs %>%
+  mutate(max_membership = apply(archetypal_wrs[, paste0("Cluster", 1:K_wr)], 1, max),
+         entropy = -apply(archetypal_wrs[, paste0("Cluster", 1:K_wr)], 1, 
+                          function(x) sum(x * log(x + 1e-10)))) %>%
+  filter(max_membership < 0.6) %>%
+  arrange(desc(entropy)) %>%
+  head(3) %>%
+  pull(Player)
+
+selected_wrs <- c(top_archetypal_players, mixed_players)
+
+# Create membership data for plotting
+wr_membership_data <- archetypal_wrs %>%
+  filter(Player %in% selected_wrs) %>%
+  pivot_longer(cols = starts_with("Cluster"), 
+               names_to = "Cluster", 
+               values_to = "Membership")
+
+# Create pie charts
+p2 <- ggplot(wr_membership_data, aes(x = "", y = Membership, fill = Cluster)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  facet_wrap(~ Player, ncol = 2) +
+  theme_void() +
+  scale_fill_viridis_d() +
+  labs(title = "WR Membership to Clusters")
+print(p2)
+ggsave("player_membership_pies.png", p2, width = 10, height = 8)
+
+# Now interpret the clusters based on their profiles
+cluster_names <- vector("character", K_wr)
+
+# Based on the output of the cluster profiles, assign meaningful names
+# This will need to be adjusted based on actual results
+cluster_names[1] <- "Possession/Slot Receiver"
+cluster_names[2] <- "Deep Threat/Big Play Receiver"
+cluster_names[3] <- "Balanced/Do-it-all Receiver"
+
+# Create a summary table with interpretations
+wr_styles <- data.frame(
+  Cluster = paste0("Cluster", 1:K_wr),
+  Style = cluster_names,
+  Description = c(
+    "High catch rate receivers focusing on shorter routes, reliable hands, and YAC",
+    "Vertical threats specializing in deep routes, explosive plays, and stretching the field",
+    "Elite all-around performers excelling in volume, efficiency, and versatility"
+  )[1:K_wr]  # This needs to be refined based on actual results
+)
+
+# Print the style interpretations
+print(wr_styles)
+
+# Create a visualization showing player archetypes
+# Dimension reduction for visualization (PCA)
+pca_wr <- prcomp(mean_alpha_wr, scale. = TRUE)
+pca_coords_wr <- as.data.frame(pca_wr$x[, 1:2])
+pca_coords_wr$player <- wr_metrics$Player
+pca_coords_wr$team <- wr_metrics$Team
+pca_coords_wr$season <- wr_metrics$Season
+
+# Find the dominant cluster for each player for coloring
+wr_membership <- as.data.frame(mean_alpha_wr)
+wr_membership$dominant_cluster <- apply(wr_membership, 1, which.max)
+pca_coords_wr$dominant_cluster <- factor(wr_membership$dominant_cluster)
+
+# Create scatter plot with player names
+p3 <- ggplot(pca_coords_wr, aes(x = PC1, y = PC2, color = dominant_cluster)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text_repel(aes(label = player), size = 3, max.overlaps = 15) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "Wide Receiver Style Map",
+       subtitle = "Based on Partial Membership Model",
+       x = "Principal Component 1", 
+       y = "Principal Component 2",
+       color = "Primary Style")
+print(p3)
+ggsave("wr_style_map.png", p3, width = 10, height = 8)
+
+# Save results
+saveRDS(list(
+  metrics = wr_metrics,
+  samples = optimal_samples_wr,
+  mean_mu = mean_mu_wr,
+  mean_alpha = mean_alpha_wr,
+  cluster_names = cluster_names,
+  archetypal_players = archetypal_wrs
+), "wr_clustering_results.rds")
+
+# Get full player cluster membership data
+# This shows each player's membership percentage in each cluster
+player_clusters <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season,
+  Cluster1 = mean_alpha_wr[, "Cluster1"],
+  Cluster2 = mean_alpha_wr[, "Cluster2"],
+  Cluster3 = mean_alpha_wr[, "Cluster3"]
+)
+
+# Calculate primary cluster for each player
+player_clusters$PrimaryCluster <- apply(player_clusters[, c("Cluster1", "Cluster2", "Cluster3")], 1, which.max)
+
+# Sort by player name for easy reference
+sorted_players <- player_clusters[order(player_clusters$Player), ]
+print(head(sorted_players, 20))
+
+# Check where key players are classified
+target_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp", "DeVonta Smith", "CeeDee Lamb")
+for(player in target_players) {
+  player_rows <- grep(player, player_clusters$Player, fixed = TRUE)
+  if(length(player_rows) > 0) {
+    cat("\n", player, "'s Cluster Memberships:\n")
+    print(player_clusters[player_rows, ])
+  }
+}
+
+# Find Hidden Gems analysis
+# First, define a list of star WRs to exclude
+star_wrs <- c(
+  "Tyreek Hill", "Justin Jefferson", "Davante Adams", "Cooper Kupp", 
+  "Stefon Diggs", "Ja'Marr Chase", "CeeDee Lamb", "Deebo Samuel",
+  "DK Metcalf", "Mike Evans", "DeVonta Smith", "A.J. Brown", 
+  "Keenan Allen", "Amon-Ra St. Brown", "Terry McLaurin", "Jaylen Waddle",
+  "Calvin Ridley", "Chris Godwin", "Tyler Lockett", "Michael Pittman Jr.",
+  "Garrett Wilson", "Drake London", "Brandon Aiyuk", "Tee Higgins"
+)
+
+# Create a version of player_clusters that excludes star WRs
+hidden_gems_candidates <- player_clusters %>%
+  filter(!Player %in% star_wrs)
+
+# Calculate balance scores (similar to RB analysis)
+hidden_gems_candidates$balanced_score <- hidden_gems_candidates$Cluster1 * 
+                                        hidden_gems_candidates$Cluster2 * 
+                                        hidden_gems_candidates$Cluster3 * 8
+
+hidden_gems_candidates$receiving_playmaking_sum <- hidden_gems_candidates$Cluster1 + 
+                                                  hidden_gems_candidates$Cluster3
+
+# Find WRs with meaningful membership in multiple clusters
+balanced_wrs <- hidden_gems_candidates %>%
+  # Filter for players with balanced abilities
+  filter(Cluster1 > 0.25 & Cluster2 > 0.25 | 
+         Cluster1 > 0.25 & Cluster3 > 0.25 | 
+         Cluster2 > 0.25 & Cluster3 > 0.25) %>%
+  # Sort by balanced score
+  arrange(desc(balanced_score)) %>%
+  # Take top 15 for visualization
+  head(15)
+
+# Print the top balanced WRs
+print("Top Balanced WRs (Strong in multiple skill areas):")
+print(balanced_wrs[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "balanced_score")])
+
+# Add original metrics for these players for additional context - use explicit dplyr functions
+balanced_wr_metrics <- balanced_wrs %>%
+  dplyr::left_join(wr_metrics %>% dplyr::select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R),
+            by = c("Player", "Team", "Season"))
+
+# Print the balanced WRs with their performance metrics
+print("Top Hidden Gems with Performance Metrics:")
+print(balanced_wr_metrics %>% 
+        dplyr::select(Player, Team, Season, Tgt, Rec, RecYds, RECTD, Ctch_pct, AvgDepthTarget, YAC_R, balanced_score) %>% 
+        dplyr::arrange(desc(balanced_score)))
+
+# Calculate specific skill combinations for different WR profiles
+balanced_wr_metrics <- balanced_wr_metrics %>%
+  dplyr::mutate(
+    # Possession + Deep score (possession receiver who can stretch the field)
+    possession_deep_score = Cluster1 * Cluster2 * 4,
+    
+    # Possession + Balanced score (reliable possession receiver with all-around skills)
+    possession_balanced_score = Cluster1 * Cluster3 * 4,
+    
+    # Deep + Balanced score (big-play threat with all-around capabilities)
+    deep_balanced_score = Cluster2 * Cluster3 * 4
+  )
+
+# Create a custom scatter plot to visualize balanced WRs
+p4 <- ggplot(player_clusters, aes(x = Cluster2, y = Cluster1)) +
+  # Add quadrant lines
+  geom_vline(xintercept = 0.33, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = 0.33, linetype = "dashed", color = "gray") +
+  # Plot all players as small points
+  geom_point(color = "gray", alpha = 0.3) +
+  # Highlight the balanced players
+  geom_point(data = balanced_wrs, aes(size = balanced_score), color = "red", alpha = 0.8) +
+  # Add labels to the top balanced players
+  geom_text_repel(data = head(balanced_wrs, 10), 
+                  aes(label = paste0(Player, " (", Season, ")")), 
+                  size = 3, 
+                  max.overlaps = 15) +
+  # Add quadrant labels
+  annotate("text", x = 0.2, y = 0.7, label = "Possession/Slot Specialists", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.2, label = "Deep Threats", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.7, label = "Balanced Receivers", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.2, y = 0.2, label = "Role Players", fontface = "bold", alpha = 0.7) +
+  # Customize the plot
+  theme_minimal() +
+  labs(title = "Finding Balanced Wide Receivers",
+       subtitle = "Players who excel in both possession receiving and deep threat abilities",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       size = "Balance Score") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+print(p4)
+ggsave("balanced_wrs.png", p4, width = 10, height = 8)
+
+# Simple similarity analysis
+calculate_similarity <- function(player1_name, player2_name, membership_data) {
+  player1 <- membership_data[membership_data$Player == player1_name, c("Cluster1", "Cluster2", "Cluster3")]
+  player2 <- membership_data[membership_data$Player == player2_name, c("Cluster1", "Cluster2", "Cluster3")]
+  
+  if (nrow(player1) == 0 || nrow(player2) == 0) {
+    return(NA)
+  }
+  
+  # Use first row if multiple seasons exist
+  player1 <- player1[1,]
+  player2 <- player2[1,]
+  
+  # Calculate Euclidean distance in cluster space
+  dist <- sqrt(sum((player1 - player2)^2))
+  
+  # Convert to similarity (higher means more similar)
+  similarity <- 1 / (1 + dist)
+  
+  return(similarity)
+}
+
+# Find similar players to a given player
+find_similar_players <- function(target_player, all_players, n=5) {
+  all_similarities <- data.frame(
+    Player = character(0),
+    Similarity = numeric(0),
+    stringsAsFactors = FALSE
+  )
+  
+  for (p in unique(all_players$Player)) {
+    if (p != target_player) {
+      sim <- calculate_similarity(target_player, p, all_players)
+      if (!is.na(sim)) {
+        all_similarities <- rbind(all_similarities, 
+                                data.frame(Player = p, Similarity = sim, stringsAsFactors = FALSE))
+      }
+    }
+  }
+  
+  # Sort by similarity and return top n
+  all_similarities <- all_similarities[order(all_similarities$Similarity, decreasing = TRUE), ]
+  return(head(all_similarities, n))
+}
+
+# Example: Find players similar to some star WRs
+example_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp")
+similarity_results <- list()
+
+for (player in example_players) {
+  cat("\nPlayers similar to", player, ":\n")
+  similar <- find_similar_players(player, player_clusters, 5)
+  print(similar)
+  similarity_results[[player]] <- similar
+}
+
+# Create a visualization of player similarities
+visualize_similarity <- function(target_player, similar_players, all_data) {
+  # Get the target player's data
+  target_data <- all_data[all_data$Player == target_player, c("Cluster1", "Cluster2", "Cluster3", "Player")]
+  if(nrow(target_data) > 1) target_data <- target_data[1,]  # Use first occurrence if multiple
+  
+  # Get data for similar players
+  similar_data <- all_data[all_data$Player %in% similar_players$Player, 
+                          c("Cluster1", "Cluster2", "Cluster3", "Player", "Team")]
+  
+  # Combine data
+  combined_data <- rbind(
+    data.frame(target_data, Type = "Target", stringsAsFactors = FALSE),
+    data.frame(similar_data, Type = "Similar", stringsAsFactors = FALSE)
+  )
+  
+  # Create plot using ggplot2 ternary plot
+  p <- ggplot(combined_data, aes(x = Cluster1, y = Cluster2, size = Cluster3)) +
+    geom_point(aes(color = Type), alpha = 0.7) +
+    scale_color_manual(values = c("Target" = "red", "Similar" = "blue")) +
+    geom_text_repel(aes(label = Player), size = 3, max.overlaps = 10) +
+    theme_minimal() +
+    labs(title = paste("Players Similar to", target_player),
+         x = "Possession/Slot Ability", 
+         y = "Deep Threat Ability",
+         size = "Balanced Ability") +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# Create similarity plots for example players
+for (player in example_players) {
+  sim_plot <- visualize_similarity(player, similarity_results[[player]], player_clusters)
+  print(sim_plot)
+  ggsave(paste0("similarity_", gsub(" ", "_", player), ".png"), sim_plot, width = 8, height = 6)
+}
+
+# Advanced: Find specialized "hidden gems" by profile type
+find_specialized_gems <- function(player_data, type = "possession", top_n = 10) {
+  # Define which clusters to emphasize based on type
+  if (type == "possession") {
+    # High Cluster1, lower others
+    player_data$score <- player_data$Cluster1 / (player_data$Cluster2 + 0.1)
+  } else if (type == "deep") {
+    # High Cluster2, lower others
+    player_data$score <- player_data$Cluster2 / (player_data$Cluster1 + 0.1)
+  } else if (type == "balanced") {
+    # High Cluster3
+    player_data$score <- player_data$Cluster3
+  } else if (type == "hybrid") {
+    # High in multiple dimensions
+    player_data$score <- player_data$Cluster1 * player_data$Cluster2 * 4
+  }
+  
+  # Sort by score and return top N
+  result <- player_data[order(player_data$score, decreasing = TRUE), ]
+  return(head(result, top_n))
+}
+
+# Find gems by type, excluding stars
+possession_gems <- find_specialized_gems(hidden_gems_candidates, "possession")
+deep_gems <- find_specialized_gems(hidden_gems_candidates, "deep")
+balanced_gems <- find_specialized_gems(hidden_gems_candidates, "balanced")
+hybrid_gems <- find_specialized_gems(hidden_gems_candidates, "hybrid")
+
+# Print results
+cat("\nPossession/Slot Receiver Hidden Gems:\n")
+print(possession_gems[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "score")])
+
+cat("\nDeep Threat Hidden Gems:\n")
+print(deep_gems[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "score")])
+
+cat("\nBalanced/Do-it-all Hidden Gems:\n")
+print(balanced_gems[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "score")])
+
+cat("\nHybrid Possession/Deep Hidden Gems:\n")
+print(hybrid_gems[, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3", "score")])
+
+# Final: Create a visualization comparing all hidden gems types
+# Create a combined dataset with gem type labels
+# Fix for the rbind error in the all_gems creation
+all_gems <- rbind(
+  cbind(possession_gems[1:5, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")], Type = "Possession"),
+  cbind(deep_gems[1:5, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")], Type = "Deep Threat"),
+  cbind(balanced_gems[1:5, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")], Type = "Balanced"),
+  cbind(hybrid_gems[1:5, c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")], Type = "Hybrid")
+)
+
+# Visualize all gem types in a scatter plot
+p5 <- ggplot(all_gems, aes(x = Cluster2, y = Cluster1, color = Type)) +
+  geom_point(size = 4, alpha = 0.7) +
+  geom_text_repel(aes(label = Player), size = 3, max.overlaps = 20) +
+  theme_minimal() +
+  labs(title = "WR Hidden Gems by Type",
+       x = "Deep Threat Ability", 
+       y = "Possession/Slot Ability") +
+  theme(legend.position = "bottom")
+print(p5)
+ggsave("hidden_gems_by_type.png", p5, width = 10, height = 8)
+
+# Save all results to a CSV file for further analysis
+write.csv(player_clusters, "wr_cluster_memberships.csv", row.names = FALSE)
+write.csv(balanced_wr_metrics, "wr_balanced_gems.csv", row.names = FALSE)
+write.csv(all_gems, "wr_specialized_gems.csv", row.names = FALSE)
+
+# Display final summary
+cat("\n===== WR Clustering Analysis Complete =====\n")
+cat("Player clusters identified:", K_wr, "\n")
+cat("Cluster names:", paste(cluster_names, collapse = ", "), "\n")
+cat("Total players analyzed:", nrow(player_clusters), "\n")
+cat("Hidden gems identified:", nrow(balanced_wrs), "\n")
+cat("Analysis results saved to disk as CSV files and PNG visualizations.\n")
+```
+
+
+
+```{r}
+# -----------------------------------------------
+# Updated Similarity Analysis (with guaranteed no repeats)
+# -----------------------------------------------
+
+# Function to calculate similarity between two players
+calculate_similarity <- function(player1_name, player2_name, membership_data) {
+  player1 <- membership_data[membership_data$Player == player1_name, c("Cluster1", "Cluster2", "Cluster3")]
+  player2 <- membership_data[membership_data$Player == player2_name, c("Cluster1", "Cluster2", "Cluster3")]
+  
+  if (nrow(player1) == 0 || nrow(player2) == 0) {
+    return(NA)
+  }
+  
+  # Use first row if multiple seasons exist
+  player1 <- player1[1,]
+  player2 <- player2[1,]
+  
+  # Calculate Euclidean distance in cluster space
+  dist <- sqrt(sum((as.numeric(player1) - as.numeric(player2))^2))
+  
+  # Convert to similarity (higher means more similar)
+  similarity <- 1 / (1 + dist)
+  
+  return(similarity)
+}
+
+# Global tracker for used players
+global_used_players <- c()
+
+# Example: Find players similar to some star WRs and create visualizations
+example_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp")
+
+# First, calculate all similarities to have a larger pool to select from
+all_similarity_results <- list()
+
+for (target_player in example_players) {
+  cat("\nCalculating similarities for", target_player, "...\n")
+  
+  # Get all potential similar players
+  all_similarities <- data.frame(
+    Player = character(0),
+    Team = character(0),
+    Season = character(0),
+    Similarity = numeric(0),
+    stringsAsFactors = FALSE
+  )
+  
+  # Make sure target player exists
+  if (!(target_player %in% player_clusters$Player)) {
+    cat("Warning: Player", target_player, "not found in data\n")
+    next
+  }
+  
+  for (i in 1:nrow(player_clusters)) {
+    p <- player_clusters$Player[i]
+    
+    # Skip if same player or in star list
+    if (p == target_player || p %in% star_wrs) {
+      next
+    }
+    
+    sim <- calculate_similarity(target_player, p, player_clusters)
+    if (!is.na(sim)) {
+      all_similarities <- rbind(all_similarities, 
+                             data.frame(
+                               Player = p, 
+                               Team = player_clusters$Team[i],
+                               Season = player_clusters$Season[i],
+                               Similarity = sim, 
+                               stringsAsFactors = FALSE)
+                             )
+    }
+  }
+  
+  # Sort by similarity
+  all_similarities <- all_similarities[order(all_similarities$Similarity, decreasing = TRUE), ]
+  all_similarity_results[[target_player]] <- all_similarities
+}
+
+# Now select top 5 for each player ensuring no repeats
+final_similar_players <- list()
+
+for (target_player in example_players) {
+  # Get the full list for this player
+  player_similarities <- all_similarity_results[[target_player]]
+  
+  # Filter out already used players
+  player_similarities <- player_similarities[!player_similarities$Player %in% global_used_players, ]
+  
+  # Get top 5
+  top_similar <- head(player_similarities, 5)
+  
+  # Add to our results and to the global used list
+  final_similar_players[[target_player]] <- top_similar
+  global_used_players <- c(global_used_players, top_similar$Player)
+  
+  cat("\nPlayers most similar to", target_player, ":\n")
+  print(top_similar)
+}
+
+# Create visualizations with the selected players
+for (target_player in example_players) {
+  # Get similar players for this target
+  similar_players <- final_similar_players[[target_player]]
+  
+  # Skip visualization if no similar players found
+  if (is.null(similar_players) || nrow(similar_players) == 0) {
+    cat("No similar players found for", target_player, "\n")
+    next
+  }
+  
+  # Get target player data and season
+  target_player_rows <- player_clusters[player_clusters$Player == target_player, ]
+  if (nrow(target_player_rows) > 0) {
+    target_data <- target_player_rows[1, ] # Use first season if multiple
+    # Create a season-labeled player name
+    target_player_with_season <- paste0(target_player, " (", target_data$Season, ")")
+  } else {
+    target_data <- data.frame(player_clusters[1, ], Player = target_player) # Fallback
+    target_player_with_season <- target_player
+  }
+  
+  # Get similar players data
+  similar_data <- player_clusters[0, ] # Empty frame with right structure
+  for (i in 1:nrow(similar_players)) {
+    player_name <- similar_players$Player[i]
+    player_season <- similar_players$Season[i]
+    
+    # Find the exact row with matching player and season
+    player_row <- player_clusters[player_clusters$Player == player_name & 
+                                 player_clusters$Season == player_season, ]
+    
+    if (nrow(player_row) > 0) {
+      similar_data <- rbind(similar_data, player_row)
+    }
+  }
+  
+  # Add season to player names for similar players
+  similar_data$PlayerLabel <- paste0(similar_data$Player, " (", similar_data$Season, ")")
+  
+  # Create a dataset for visualization
+  plot_data <- rbind(
+    data.frame(target_data, PlayerType = "Target", PlayerLabel = target_player_with_season),
+    data.frame(similar_data, PlayerType = "Similar")
+  )
+  
+  # Create the visualization
+  p <- ggplot(plot_data, aes(x = Cluster2, y = Cluster1, size = Cluster3, color = PlayerType)) +
+    geom_point(alpha = 0.7) +
+    geom_text_repel(aes(label = PlayerLabel), size = 3, max.overlaps = 10) +
+    scale_color_manual(values = c("Target" = "red", "Similar" = "blue")) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    labs(title = paste("Players Similar to", target_player_with_season),
+         subtitle = "Based on cluster membership profiles",
+         x = "Deep Threat Ability", 
+         y = "Possession/Slot Ability",
+         size = "Balanced Ability", 
+         color = "Player Type")
+  
+  print(p)
+  ggsave(paste0("similarity_", gsub(" ", "_", target_player), "_white_bg.png"), p, width = 10, height = 8, bg = "white")
+}
+
+# -----------------------------------------------
+# Ensure Hidden Gems Plot is Created
+# -----------------------------------------------
+
+# Try creating the hidden gems plot with more error checking
+tryCatch({
+  # Find gems by type, excluding stars
+  possession_gems <- find_specialized_gems(player_clusters, star_wrs, "possession")
+  deep_gems <- find_specialized_gems(player_clusters, star_wrs, "deep")
+  balanced_gems <- find_specialized_gems(player_clusters, star_wrs, "balanced")
+  hybrid_gems <- find_specialized_gems(player_clusters, star_wrs, "hybrid")
+  
+  # Verify we have data for each type
+  has_possession <- !is.null(possession_gems) && nrow(possession_gems) > 0
+  has_deep <- !is.null(deep_gems) && nrow(deep_gems) > 0
+  has_balanced <- !is.null(balanced_gems) && nrow(balanced_gems) > 0
+  has_hybrid <- !is.null(hybrid_gems) && nrow(hybrid_gems) > 0
+  
+  cat("Data available for plotting:\n")
+  cat("Possession gems:", has_possession, "\n")
+  cat("Deep threat gems:", has_deep, "\n")
+  cat("Balanced gems:", has_balanced, "\n")
+  cat("Hybrid gems:", has_hybrid, "\n")
+  
+  # Create a combined dataset safely with error checking
+  all_gems <- data.frame()
+  
+  if (has_possession) {
+    poss_data <- possession_gems[1:min(3, nrow(possession_gems)), c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")]
+    poss_data$GemType <- "Possession"
+    all_gems <- rbind(all_gems, poss_data)
+  }
+  
+  if (has_deep) {
+    deep_data <- deep_gems[1:min(3, nrow(deep_gems)), c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")]
+    deep_data$GemType <- "Deep Threat"
+    all_gems <- rbind(all_gems, deep_data)
+  }
+  
+  if (has_balanced) {
+    bal_data <- balanced_gems[1:min(3, nrow(balanced_gems)), c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")]
+    bal_data$GemType <- "Balanced"
+    all_gems <- rbind(all_gems, bal_data)
+  }
+  
+  if (has_hybrid) {
+    hyb_data <- hybrid_gems[1:min(3, nrow(hybrid_gems)), c("Player", "Team", "Season", "Cluster1", "Cluster2", "Cluster3")]
+    hyb_data$GemType <- "Hybrid"
+    all_gems <- rbind(all_gems, hyb_data)
+  }
+  
+  # Only create plot if we have data
+  if (nrow(all_gems) > 0) {
+    # Create a combined plot
+    p2 <- ggplot(all_gems, aes(x = Cluster2, y = Cluster1, color = GemType)) +
+      geom_point(size = 4, alpha = 0.8) +
+      geom_text_repel(aes(label = paste0(Player, " (", Season, ")")), size = 3, max.overlaps = 20) +
+      scale_color_viridis_d() +
+      theme_minimal() +
+      theme(
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA),
+        legend.background = element_rect(fill = "white", color = NA),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5)
+      ) +
+      labs(title = "WR Hidden Gems by Type",
+           subtitle = "Non-star players with specialized or balanced skill sets",
+           x = "Deep Threat Ability", 
+           y = "Possession/Slot Ability",
+           color = "Gem Type")
+    
+    print(p2)
+    ggsave("all_hidden_gems_white_bg.png", p2, width = 10, height = 8, bg = "white")
+    
+    # Save the hidden gems data
+    write.csv(all_gems, "wr_hidden_gems.csv", row.names = FALSE)
+    
+    cat("Hidden gems visualization successfully created\n")
+  } else {
+    cat("No hidden gems data available for visualization\n")
+  }
+}, error = function(e) {
+  cat("Error creating hidden gems plot:", e$message, "\n")
+  
+  # Try an even simpler version if the first attempt failed
+  tryCatch({
+    # Get some non-star players from each quadrant of the plot
+    q1 <- player_clusters[player_clusters$Cluster1 > 0.6 & player_clusters$Cluster2 < 0.3 & !player_clusters$Player %in% star_wrs, ]
+    q2 <- player_clusters[player_clusters$Cluster2 > 0.6 & player_clusters$Cluster1 < 0.3 & !player_clusters$Player %in% star_wrs, ]
+    q3 <- player_clusters[player_clusters$Cluster1 > 0.4 & player_clusters$Cluster2 > 0.4 & !player_clusters$Player %in% star_wrs, ]
+    q4 <- player_clusters[player_clusters$Cluster3 > 0.6 & !player_clusters$Player %in% star_wrs, ]
+    
+    # Combine data
+    basic_gems <- rbind(
+      cbind(head(q1, 2), GemType = "Possession"),
+      cbind(head(q2, 2), GemType = "Deep Threat"),
+      cbind(head(q3, 2), GemType = "Hybrid"),
+      cbind(head(q4, 2), GemType = "Balanced")
+    )
+    
+    if (nrow(basic_gems) > 0) {
+      # Create basic plot
+      p_basic <- ggplot(basic_gems, aes(x = Cluster2, y = Cluster1, color = GemType)) +
+        geom_point(size = 4) +
+        geom_text_repel(aes(label = Player), size = 3) +
+        theme_minimal() +
+        theme(panel.background = element_rect(fill = "white")) +
+        labs(title = "Basic WR Types", x = "Deep Threat", y = "Possession")
+      
+      print(p_basic)
+      ggsave("basic_wr_types.png", p_basic, width = 8, height = 6, bg = "white")
+    }
+  }, error = function(e2) {
+    cat("Fallback plot also failed:", e2$message, "\n")
+  })
+})
+```
+
+
+
+```{r}
+
+# -----------------------------------------------
+# Simplified Correlated Gaussian Partial Membership Model
+# -----------------------------------------------
+
+# Load required packages
+library(nimble)
+library(label.switching)
+library(tidyverse)
+library(MCMCpack)  # For Dirichlet distribution
+library(fmsb)      # For radar charts
+library(viridis)   # For better color palettes
+library(ggrepel)   # For better text labels in plots
+library(corrplot)  # For correlation visualization
+
+# Setting up the working directory - modify as needed
+# setwd("YOUR/DIRECTORY/PATH")
+
+# Ensure plots will be saved with white backgrounds
+options(device = "RStudioGD")
+theme_set(theme_minimal() + 
+          theme(
+            panel.background = element_rect(fill = "white", color = NA),
+            plot.background = element_rect(fill = "white", color = NA),
+            legend.background = element_rect(fill = "white", color = NA)
+          ))
+
+# Read the wide receiver data
+# Note: skip = 1 to skip the header row
+wr_data <- read.csv("WR Stats all.csv", skip = 1) 
+
+# Print dimensions for verification
+print(dim(wr_data))
+
+# Rename the columns for better usability
+colnames(wr_data) <- c("Rank", "Player", "Tgt_raw", "Season", "Age", "Team", 
+                     "Games", "GS", "Tgt", "Rec", "RecYds", "Y_Rec", "RECTD", 
+                     "RecY_G", "Ctch_pct", "Yard_Tgt", "Rec1D", "RecSucc_pct", 
+                     "AirYards", "AirY_Rec", "YAC", "YAC_R", "AvgDepthTarget",
+                     "RecBrkTkl", "Rec_Br", "Drop", "Drop_pct", "Int", "PasserRating")
+
+# Display the first few rows to verify
+print(head(wr_data))
+
+# Function to prepare WR data for clustering
+prepare_wr_data <- function(data) {
+  # Create a data frame with our selected columns
+  wr_metrics <- data.frame(
+    Player = data$Player,
+    Team = data$Team,
+    Season = data$Season,
+    
+    # Key performance metrics for wide receivers
+    Tgt = as.numeric(as.character(data$Tgt)),               # Targets
+    Rec = as.numeric(as.character(data$Rec)),               # Receptions
+    RecYds = as.numeric(as.character(data$RecYds)),         # Receiving Yards
+    RECTD = as.numeric(as.character(data$RECTD)),           # Receiving TDs
+    Ctch_pct = as.numeric(as.character(data$Ctch_pct)),     # Catch Percentage
+    Yard_Tgt = as.numeric(as.character(data$Yard_Tgt)),     # Yards per Target
+    Rec1D = as.numeric(as.character(data$Rec1D)),           # First Downs
+    RecSucc_pct = as.numeric(as.character(data$RecSucc_pct)), # Success Rate
+    AirYards = as.numeric(as.character(data$AirYards)),     # Air Yards
+    AirY_Rec = as.numeric(as.character(data$AirY_Rec)),     # Air Yards per Reception
+    YAC = as.numeric(as.character(data$YAC)),               # Yards After Catch
+    YAC_R = as.numeric(as.character(data$YAC_R)),           # YAC per Reception
+    AvgDepthTarget = as.numeric(as.character(data$AvgDepthTarget)), # Avg Depth of Target
+    RecBrkTkl = as.numeric(as.character(data$RecBrkTkl)),   # Broken Tackles
+    Drop_pct = as.numeric(as.character(data$Drop_pct))      # Drop Percentage
+  )
+  
+  # Show a preview
+  print(head(wr_metrics))
+  
+  # Filter out rows with missing values or invalid data
+  wr_metrics <- wr_metrics %>%
+    filter(!is.na(Tgt) & 
+           !is.na(Rec) &
+           !is.na(RecYds) &
+           !is.na(RECTD))
+  
+  # Create standardized versions of the metrics
+  wr_metrics$scaled_Tgt <- scale(wr_metrics$Tgt)
+  wr_metrics$scaled_Rec <- scale(wr_metrics$Rec)
+  wr_metrics$scaled_RecYds <- scale(wr_metrics$RecYds)
+  wr_metrics$scaled_RECTD <- scale(wr_metrics$RECTD)
+  wr_metrics$scaled_Ctch_pct <- scale(wr_metrics$Ctch_pct)
+  wr_metrics$scaled_Yard_Tgt <- scale(wr_metrics$Yard_Tgt)
+  wr_metrics$scaled_Rec1D <- scale(wr_metrics$Rec1D)
+  wr_metrics$scaled_RecSucc_pct <- scale(wr_metrics$RecSucc_pct)
+  wr_metrics$scaled_AirYards <- scale(wr_metrics$AirYards)
+  wr_metrics$scaled_AirY_Rec <- scale(wr_metrics$AirY_Rec)
+  wr_metrics$scaled_YAC <- scale(wr_metrics$YAC)
+  wr_metrics$scaled_YAC_R <- scale(wr_metrics$YAC_R)
+  wr_metrics$scaled_AvgDepthTarget <- scale(wr_metrics$AvgDepthTarget)
+  wr_metrics$scaled_RecBrkTkl <- scale(wr_metrics$RecBrkTkl)
+  wr_metrics$scaled_Drop_pct <- scale(wr_metrics$Drop_pct)
+  
+  return(wr_metrics)
+}
+
+# Apply the data preparation function
+wr_metrics <- prepare_wr_data(wr_data)
+
+# Check the structure of the prepared data
+head(wr_metrics)
+summary(wr_metrics)
+
+# Check correlations between metrics
+scaled_cols <- grep("^scaled_", names(wr_metrics), value = TRUE)
+cor_matrix <- cor(wr_metrics[, scaled_cols], use = "complete.obs")
+corrplot(cor_matrix, method = "circle", 
+         type = "upper", order = "hclust", 
+         tl.col = "black", tl.cex = 0.7,
+         title = "Correlation Matrix of WR Metrics",
+         mar = c(0, 0, 1, 0))
+
+# Plot the correlation matrix and save it
+png("wr_metrics_correlation.png", width = 1000, height = 1000, res = 120, bg = "white")
+corrplot(cor_matrix, method = "circle", 
+         type = "upper", order = "hclust", 
+         tl.col = "black", tl.cex = 0.7,
+         title = "Correlation Matrix of WR Metrics",
+         mar = c(0, 0, 1, 0))
+dev.off()
+
+# -----------------------------------------------
+# Alternative: Use Standard PM Model with PCA Transformation
+# -----------------------------------------------
+
+# Since the full correlated model has implementation challenges,
+# we'll use a two-step approach:
+# 1. Apply PCA to capture correlations between metrics
+# 2. Run a standard PM model on the uncorrelated PCA components
+
+# Apply PCA to the standardized data
+pca_result <- prcomp(X_wr, scale. = FALSE)  # Data is already standardized
+
+# Determine how many components to keep (e.g., explain 90% of variance)
+var_explained <- cumsum(pca_result$sdev^2 / sum(pca_result$sdev^2))
+num_components <- min(which(var_explained >= 0.9))
+
+cat("Number of PCA components explaining 90% of variance:", num_components, "\n")
+cat("Variance explained by each component:\n")
+print(var_explained[1:min(15, length(var_explained))])
+
+# Extract the PCA scores for the selected components
+pca_scores <- pca_result$x[, 1:num_components]
+
+# Plot the variance explained
+var_df <- data.frame(
+  Component = 1:length(pca_result$sdev),
+  Variance = pca_result$sdev^2 / sum(pca_result$sdev^2),
+  CumVariance = var_explained
+)
+
+p_var <- ggplot(var_df, aes(x = Component)) +
+  geom_bar(aes(y = Variance), stat = "identity", fill = "steelblue") +
+  geom_line(aes(y = CumVariance), color = "red", size = 1) +
+  geom_point(aes(y = CumVariance), color = "red", size = 3) +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "white")) +
+  labs(title = "PCA Variance Explained", 
+       y = "Proportion of Variance", 
+       x = "Principal Component")
+
+print(p_var)
+ggsave("pca_variance_explained.png", p_var, width = 8, height = 6, bg = "white")
+
+# Plot the PCA loadings to interpret components
+loadings <- pca_result$rotation[, 1:min(5, num_components)]
+loadings_df <- as.data.frame(loadings)
+loadings_df$Metric <- rownames(loadings)
+loadings_long <- pivot_longer(loadings_df, 
+                              cols = -Metric, 
+                              names_to = "Component", 
+                              values_to = "Loading")
+
+p_load <- ggplot(loadings_long, aes(x = Metric, y = Loading, fill = Loading)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ Component, ncol = 1) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.background = element_rect(fill = "white")
+  ) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "PCA Loadings by Component", 
+       x = "Metric", 
+       y = "Loading")
+
+print(p_load)
+ggsave("pca_loadings.png", p_load, width = 10, height = 12, bg = "white")
+
+# Now run the partial membership model on the PCA components
+# Define the model code for PCA-based PM model
+pca_pm_code <- nimbleCode({
+  # Priors for mean parameters (cluster centers)
+  for(k in 1:K) {
+    for(j in 1:J) {
+      mu[k, j] ~ dnorm(0, 0.1)  # Prior for cluster means
+      sigma[k, j] ~ dunif(0.1, 2)  # Prior for standard deviation
+    }
+  }
+  
+  # Prior for Dirichlet parameter
+  delta ~ dunif(0, 10)  # Following the paper's approach
+  
+  # Create fixed vector for Dirichlet distribution
+  for(k in 1:K) {
+    delta_vec[k] <- delta  # Create a vector of identical delta values
+  }
+  
+  # For each player
+  for(i in 1:N) {
+    # Membership weights follow Dirichlet distribution
+    alpha[i, 1:K] ~ ddirch(delta_vec[1:K])  
+    
+    # For each PCA component
+    for(j in 1:J) {
+      # Calculate expected value for this player's jth component
+      mu_ij[i, j] <- inprod(alpha[i, 1:K], mu[1:K, j])
+      
+      # Calculate variance
+      var_temp[i, j] <- inprod(alpha[i, 1:K], sigma[1:K, j]^2)
+      prec_ij[i, j] <- 1/var_temp[i, j]
+      
+      # Data likelihood (PCA components are uncorrelated by design)
+      X[i, j] ~ dnorm(mu_ij[i, j], prec_ij[i, j])
+    }
+  }
+})
+
+# Set up constants for PCA-based model
+N_wr <- nrow(pca_scores)  # Number of players
+J_wr <- ncol(pca_scores)  # Number of PCA components
+
+# Run for different K values to find optimal number of clusters
+K_values <- 2:4  # Reduced range due to computational demands
+waic_results_wr <- vector("list", length(K_values))
+
+for(i in 1:length(K_values)) {
+  K <- K_values[i]
+  
+  # Constants for the model
+  constants <- list(
+    N = N_wr,
+    J = J_wr,
+    K = K
+  )
+  
+  # Data for the model
+  data <- list(
+    X = pca_scores
+  )
+  
+  # Initial values
+  inits <- list(
+    mu = matrix(rnorm(K*J_wr, 0, 0.1), K, J_wr),
+    sigma = matrix(runif(K*J_wr, 0.5, 1.5), K, J_wr),
+    alpha = matrix(rdirichlet(N_wr, rep(1, K)), N_wr, K),
+    delta = 1,
+    delta_vec = rep(1, K)
+  )
+  
+  # Build and compile the model
+  wr_model <- nimbleModel(pca_pm_code, constants = constants, data = data, inits = inits)
+  compiled_model <- compileNimble(wr_model)
+  
+  # Set up MCMC configuration
+  mcmc_conf <- configureMCMC(wr_model, monitors = c("mu", "sigma", "alpha", "delta"), enableWAIC = TRUE)
+  mcmc <- buildMCMC(mcmc_conf)
+  compiled_mcmc <- compileNimble(mcmc, project = wr_model)
+  
+  # Run the MCMC
+  cat("Running PCA-based model with K =", K, "\n")
+  samples <- runMCMC(compiled_mcmc, 
+                   niter = 10000,      # Iterations
+                   nburnin = 2000,     # Burn-in period
+                   thin = 20,          # Thinning interval
+                   summary = TRUE,
+                   WAIC = TRUE)        # Calculate WAIC for model comparison
+  
+  # Extract WAIC value
+  waic_value <- as.numeric(samples$WAIC$WAIC)
+  
+  # Store results
+  waic_results_wr[[i]] <- list(
+    K = K,
+    WAIC = waic_value,
+    samples = samples
+  )
+  
+  cat("Completed. WAIC =", waic_value, "\n\n")
+  
+  # Save intermediate results in case of crashes
+  saveRDS(waic_results_wr, paste0("pca_model_results_K", K, ".rds"))
+}
+
+# Find optimal K
+waic_values_wr <- sapply(waic_results_wr, function(x) x$WAIC)
+optimal_K_wr <- K_values[which.min(waic_values_wr)]
+cat("Optimal number of clusters for WRs:", optimal_K_wr, "\n")
+
+# For stability in interpreting results, we'll use optimal_K_wr
+K_wr <- optimal_K_wr 
+
+# Extract samples from the optimal run
+optimal_samples_wr <- waic_results_wr[[which(K_values == K_wr)]]$samples
+
+# Extract the relevant samples
+alpha_samples <- optimal_samples_wr$samples[, grep("alpha", colnames(optimal_samples_wr$samples))]
+mu_samples <- optimal_samples_wr$samples[, grep("^mu\\[", colnames(optimal_samples_wr$samples))]
+
+# Process the cluster centers directly (skip label switching)
+cat("Processing cluster results directly...\n")
+
+# Calculate mean alphas (membership weights)
+alpha_means <- matrix(0, nrow = N_wr, ncol = K_wr)
+colnames(alpha_means) <- paste0("Cluster", 1:K_wr)
+rownames(alpha_means) <- wr_metrics$Player
+
+for(i in 1:N_wr) {
+  for(k in 1:K_wr) {
+    alpha_means[i, k] <- mean(alpha_samples[, paste0("alpha[", i, ", ", k, "]")])
+  }
+}
+
+# Calculate mean mus (cluster centers for PCA components)
+mu_means <- array(0, dim = c(K_wr, J_wr))
+colnames(mu_means) <- paste0("PC", 1:J_wr)
+rownames(mu_means) <- paste0("Cluster", 1:K_wr)
+
+for(k in 1:K_wr) {
+  for(j in 1:J_wr) {
+    mu_means[k, j] <- mean(mu_samples[, paste0("mu[", k, ", ", j, "]")])
+  }
+}
+
+# Transform the PCA cluster centers back to the original metrics space
+# for better interpretability
+cluster_centers_original <- matrix(0, nrow = K_wr, ncol = ncol(X_wr))
+colnames(cluster_centers_original) <- colnames(X_wr)
+rownames(cluster_centers_original) <- paste0("Cluster", 1:K_wr)
+
+for(k in 1:K_wr) {
+  # Original space = PCA loadings * PCA cluster center
+  cluster_centers_original[k, ] <- t(pca_result$rotation[, 1:J_wr] %*% mu_means[k, ])
+}
+
+# Order clusters by size for consistency
+cluster_sizes <- colSums(alpha_means)
+print("Cluster sizes (sum of membership weights):")
+print(cluster_sizes)
+
+# Order indices
+order_idx <- order(cluster_sizes, decreasing = TRUE)
+
+# Reorder mu and alpha
+mean_mu_wr <- cluster_centers_original[order_idx, ]
+rownames(mean_mu_wr) <- paste0("Cluster", 1:K_wr)
+mean_alpha_wr <- alpha_means[, order_idx]
+colnames(mean_alpha_wr) <- paste0("Cluster", 1:K_wr)
+
+# Now continue with visualization and interpretation...
+# Create a data frame for cluster profiles
+wr_cluster_profiles <- as.data.frame(mean_mu_wr) %>%
+  rownames_to_column("Cluster") %>%
+  pivot_longer(-Cluster, names_to = "Metric", values_to = "Value")
+
+# Plot cluster profiles
+p1 <- ggplot(wr_cluster_profiles, aes(x = Metric, y = Value, color = Cluster, group = Cluster)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  labs(title = "WR Cluster Profiles (PCA-based Correlated Model)", y = "Standardized Value")
+print(p1)
+ggsave("pca_cluster_profiles.png", p1, width = 10, height = 6, bg = "white")
+
+# Create a data frame for archetypal players
+archetypal_wrs <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season,
+  mean_alpha_wr
+)
+
+# Find top players for each cluster
+for(k in 1:K_wr) {
+  cat("\nCluster", k, "archetypes:\n")
+  cluster_col <- paste0("Cluster", k)
+  top_players <- archetypal_wrs[order(archetypal_wrs[, cluster_col], decreasing = TRUE), ]
+  print(head(top_players[, c("Player", "Team", "Season", cluster_col)], 5))
+}
+
+# Save results
+saveRDS(list(
+  metrics = wr_metrics,
+  pca_result = pca_result,
+  samples = optimal_samples_wr,
+  mean_mu = mean_mu_wr,
+  mean_alpha = mean_alpha_wr,
+  cluster_names = NULL,  # Will be assigned later
+  archetypal_players = archetypal_wrs
+), "pca_wr_clustering_results.rds")
+
+# Get full player cluster membership data
+player_clusters <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season
+)
+
+# Add cluster memberships
+for (k in 1:K_wr) {
+  player_clusters[[paste0("Cluster", k)]] <- mean_alpha_wr[, paste0("Cluster", k)]
+}
+
+# Calculate primary cluster for each player
+player_clusters$PrimaryCluster <- apply(player_clusters[, paste0("Cluster", 1:K_wr)], 1, which.max)
+
+# Sort by player name for easy reference
+sorted_players <- player_clusters[order(player_clusters$Player), ]
+print(head(sorted_players, 20))
+
+# Save player clusters as CSV for further analysis
+write.csv(player_clusters, "pca_wr_clusters.csv", row.names = FALSE)
+
+cat("\nPCA-based Correlated Clustering Model analysis complete.\n")
+cat("Results have been saved to disk.\n")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Print the balanced WRs with their performance metrics
+print("Top Hidden Gems with Performance Metrics:")
+print(balanced_wr_metrics[
+  order(balanced_wr_metrics$balanced_score, decreasing = TRUE), 
+  c("Player", "Team", "Season", "Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", "AvgDepthTarget", "YAC_R", "balanced_score")
+])
+
+# Calculate specific skill combinations for different WR profiles
+balanced_wr_metrics$possession_deep_score <- balanced_wr_metrics$Cluster1 * balanced_wr_metrics$Cluster2 * 4
+balanced_wr_metrics$possession_balanced_score <- balanced_wr_metrics$Cluster1 * balanced_wr_metrics$Cluster3 * 4
+balanced_wr_metrics$deep_balanced_score <- balanced_wr_metrics$Cluster2 * balanced_wr_metrics$Cluster3 * 4
+
+# Create a custom scatter plot to visualize balanced WRs
+p4 <- ggplot(player_clusters, aes(x = Cluster2, y = Cluster1)) +
+  # Add quadrant lines
+  geom_vline(xintercept = 0.33, linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = 0.33, linetype = "dashed", color = "gray") +
+  # Plot all players as small points
+  geom_point(color = "gray", alpha = 0.3) +
+  # Highlight the balanced players
+  geom_point(data = balanced_wrs, aes(size = balanced_score), color = "red", alpha = 0.8) +
+  # Add labels to the top balanced players
+  geom_text_repel(data = head(balanced_wrs, 10), 
+                  aes(label = paste0(Player, " (", Season, ")")), 
+                  size = 3, 
+                  max.overlaps = 15) +
+  # Add quadrant labels
+  annotate("text", x = 0.2, y = 0.7, label = "Possession/Slot Specialists", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.2, label = "Deep Threats", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.7, y = 0.7, label = "Balanced Receivers", fontface = "bold", alpha = 0.7) +
+  annotate("text", x = 0.2, y = 0.2, label = "Role Players", fontface = "bold", alpha = 0.7) +
+  # Customize the plot
+  theme_minimal() +
+  labs(title = "Finding Balanced Wide Receivers",
+       subtitle = "Players who excel in both possession receiving and deep threat abilities",
+       x = "Deep Threat Ability",
+       y = "Possession/Slot Ability",
+       size = "Balance Score") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+print(p4)
+ggsave("balanced_wrs.png", p4, width = 10, height = 8)
+
+# Display final summary
+cat("\n===== WR Clustering Analysis Complete =====\n")
+cat("Player clusters identified:", K_wr, "\n")
+cat("Cluster names:", paste(cluster_names, collapse = ", "), "\n")
+cat("Total players analyzed:", nrow(player_clusters), "\n")
+cat("Hidden gems identified:", nrow(balanced_wrs), "\n")
+cat("Analysis results saved to disk as CSV files and PNG visualizations.\n")
+
+# Save all results to CSV files for further analysis
+write.csv(player_clusters, "wr_cluster_memberships.csv", row.names = FALSE)
+write.csv(balanced_wr_metrics, "wr_balanced_gems.csv", row.names = FALSE)
+write.csv(all_gems, "wr_specialized_gems.csv", row.names = FALSE)
+
+# Create a visualization comparing key metrics between clusters
+# Calculate mean values per cluster for key metrics
+cluster_key_metrics <- aggregate(
+  cbind(Tgt, Rec, RecYds, RECTD, Ctch_pct, Yard_Tgt, AvgDepthTarget, YAC_R) ~ PrimaryCluster, 
+  data = merge(player_clusters, wr_metrics, by = c("Player", "Team", "Season")),
+  FUN = function(x) mean(x, na.rm = TRUE)
+)
+
+# Add cluster names
+cluster_key_metrics$PrimaryClusterName <- cluster_names[cluster_key_metrics$PrimaryCluster]
+
+# Reshape for plotting
+metrics_to_plot <- c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", "Yard_Tgt", "AvgDepthTarget", "YAC_R")
+metrics_long <- data.frame(
+  PrimaryClusterName = rep(cluster_key_metrics$PrimaryClusterName, length(metrics_to_plot)),
+  Metric = rep(c("Targets", "Receptions", "Receiving Yards", "Receiving TDs", 
+                "Catch %", "Yards per Target", "Avg Depth", "YAC per Reception"), 
+              each = nrow(cluster_key_metrics)),
+  Value = as.vector(as.matrix(cluster_key_metrics[, metrics_to_plot]))
+)
+
+# Create bar plots for key metrics by cluster
+p7 <- ggplot(metrics_long, aes(x = PrimaryClusterName, y = Value, fill = PrimaryClusterName)) +
+  geom_col() +
+  facet_wrap(~ Metric, scales = "free_y", ncol = 2) +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom") +
+  labs(title = "Key Metrics by Receiver Cluster",
+       x = "",
+       y = "",
+       fill = "Cluster")
+print(p7)
+ggsave("cluster_key_metrics.png", p7, width = 12, height = 10)
+
+# Try to load ggtern package for triangular plot
+if(requireNamespace("ggtern", quietly = TRUE)) {
+  # Create ternary plot
+  library(ggtern)
+  p_tern <- ggtern(data = player_clusters, 
+                 aes(x = Cluster1, y = Cluster2, z = Cluster3, color = factor(PrimaryCluster))) +
+    geom_point(alpha = 0.6) +
+    labs(title = "Wide Receiver Cluster Membership",
+         subtitle = "Each point represents a receiver positioned by their cluster memberships",
+         x = "Possession/Slot Receiver",
+         y = "Deep Threat Receiver",
+         z = "Balanced Receiver",
+         color = "Primary Cluster") +
+    theme_minimal() +
+    guides(color = guide_legend(title = "Primary Cluster")) +
+    scale_color_viridis_d()
+  
+  # Add text labels for notable players
+  if(length(notable_idx) > 0) {
+    p_tern <- p_tern + 
+      geom_text_repel(data = player_clusters[notable_idx, ],
+                      aes(label = Player), 
+                      size = 3)
+  }
+  
+  print(p_tern)
+  ggsave("wr_ternary_plot.png", p_tern, width = 10, height = 8)
+}
+
+# Generate a similarity network visualization (if igraph is available)
+if(requireNamespace("igraph", quietly = TRUE)) {
+  # Create a similarity matrix between top players in each cluster
+  top_players_list <- unique(top_players_df$Player)
+  similarity_matrix <- matrix(0, nrow = length(top_players_list), ncol = length(top_players_list))
+  rownames(similarity_matrix) <- top_players_list
+  colnames(similarity_matrix) <- top_players_list
+  
+  # Calculate similarities
+  for(i in 1:length(top_players_list)) {
+    for(j in 1:length(top_players_list)) {
+      if(i != j) {
+        similarity_matrix[i, j] <- calculate_similarity(top_players_list[i], top_players_list[j], player_clusters)
+      }
+    }
+  }
+  
+  # Get primary cluster for each top player
+  top_players_data <- player_clusters[match(top_players_list, player_clusters$Player), c("Player", "PrimaryCluster")]
+  
+  # Creating a data frame of connections for network visualization
+  # Only include strong connections (similarity > threshold)
+  similarity_threshold <- 0.7
+  network_edges <- data.frame(
+    from = character(0),
+    to = character(0),
+    weight = numeric(0),
+    stringsAsFactors = FALSE
+  )
+  
+  for(i in 1:nrow(similarity_matrix)) {
+    for(j in 1:ncol(similarity_matrix)) {
+      if(i != j && similarity_matrix[i, j] > similarity_threshold) {
+        network_edges <- rbind(network_edges, data.frame(
+          from = rownames(similarity_matrix)[i],
+          to = colnames(similarity_matrix)[j],
+          weight = similarity_matrix[i, j],
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+  }
+  
+  # If we have edges, create a network visualization
+  if(nrow(network_edges) > 0) {
+    library(igraph)
+    # Create the graph
+    g <- graph_from_data_frame(network_edges, directed = FALSE, vertices = top_players_data)
+    
+    # Add vertex attributes
+    V(g)$cluster <- top_players_data$PrimaryCluster[match(V(g)$name, top_players_data$Player)]
+    
+    # Set up colors by cluster
+    cluster_colors <- viridis(K_wr)
+    V(g)$color <- cluster_colors[V(g)$cluster]
+    
+    # Set edge width by weight
+    E(g)$width <- E(g)$weight * 5
+    
+    # Set layout
+    layout <- layout_with_fr(g)
+    
+    # Create plot
+    png("player_similarity_network.png", width = 1000, height = 1000, res = 100)
+    plot(g, layout = layout, 
+         vertex.label = V(g)$name,
+         vertex.label.cex = 0.8,
+         vertex.size = 15,
+         vertex.label.color = "black",
+         edge.color = "gray",
+         main = "Wide Receiver Similarity Network")
+    legend("topright", legend = paste("Cluster", 1:K_wr, "-", cluster_names), 
+           col = cluster_colors, pch = 19, pt.cex = 1.5, cex = 0.8)
+    dev.off()
+  }
+}
+
+# Final output message
+cat("\n======================================================\n")
+cat("Wide Receiver Clustering Analysis Complete!\n")
+cat("======================================================\n")
+cat("Analysis performed using Partial Membership Models with multiple distributions:\n")
+cat("- Negative Binomial for overdispersed counts\n")
+cat("- Poisson for regular counts\n")
+cat("- Gamma for continuous positive metrics\n")
+cat("- Beta for proportions\n")
+cat("- Normal for symmetric metrics\n\n")
+cat("Results saved in CSV files and visualizations\n")
+cat("======================================================\n")# -----------------------------------------------
+# Wide Receiver Clustering with Partial Membership Models
+# Using Multiple Distributions for Different Metric Types
+# Base R Version - No tidyverse dependencies
+# -----------------------------------------------
+
+# Load required packages
+library(nimble)
+library(label.switching)
+library(MCMCpack)  # For Dirichlet distribution
+library(fmsb)      # For radar charts
+library(viridis)   # For better color palettes
+library(ggrepel)   # For better text labels in plots
+library(corrplot)  # For correlation visualization
+library(reshape2)  # For data reshaping (melt function)
+library(ggplot2)   # For plotting
+
+# Ensure plots will be saved
+options(device = "RStudioGD")
+
+# Read the wide receiver data
+# Note: skip = 1 to skip the header row
+wr_data <- read.csv("WR Stats all.csv", skip = 1) 
+
+# Print dimensions for verification
+print(dim(wr_data))
+
+# Rename the columns for better usability
+colnames(wr_data) <- c("Rank", "Player", "Tgt_raw", "Season", "Age", "Team", 
+                     "Games", "GS", "Tgt", "Rec", "RecYds", "Y_Rec", "RECTD", 
+                     "RecY_G", "Ctch_pct", "Yard_Tgt", "Rec1D", "RecSucc_pct", 
+                     "AirYards", "AirY_Rec", "YAC", "YAC_R", "AvgDepthTarget",
+                     "RecBrkTkl", "Rec_Br", "Drop", "Drop_pct", "Int", "PasserRating")
+
+# Display the first few rows to verify
+print(head(wr_data))
+
+# Function to prepare WR data for clustering
+prepare_wr_data <- function(data) {
+  # Create a data frame with our selected columns
+  wr_metrics <- data.frame(
+    Player = data$Player,
+    Team = data$Team,
+    Season = data$Season,
+    
+    # Key performance metrics for wide receivers
+    Tgt = as.numeric(as.character(data$Tgt)),               # Targets
+    Rec = as.numeric(as.character(data$Rec)),               # Receptions
+    RecYds = as.numeric(as.character(data$RecYds)),         # Receiving Yards
+    RECTD = as.numeric(as.character(data$RECTD)),           # Receiving TDs
+    Ctch_pct = as.numeric(as.character(data$Ctch_pct)),     # Catch Percentage
+    Yard_Tgt = as.numeric(as.character(data$Yard_Tgt)),     # Yards per Target
+    Rec1D = as.numeric(as.character(data$Rec1D)),           # First Downs
+    RecSucc_pct = as.numeric(as.character(data$RecSucc_pct)), # Success Rate
+    AirYards = as.numeric(as.character(data$AirYards)),     # Air Yards
+    AirY_Rec = as.numeric(as.character(data$AirY_Rec)),     # Air Yards per Reception
+    YAC = as.numeric(as.character(data$YAC)),               # Yards After Catch
+    YAC_R = as.numeric(as.character(data$YAC_R)),           # YAC per Reception
+    AvgDepthTarget = as.numeric(as.character(data$AvgDepthTarget)), # Avg Depth of Target
+    RecBrkTkl = as.numeric(as.character(data$RecBrkTkl)),   # Broken Tackles
+    Drop_pct = as.numeric(as.character(data$Drop_pct))      # Drop Percentage
+  )
+  
+  # Show a preview
+  print(head(wr_metrics))
+  
+  # Filter out rows with missing values or invalid data
+  wr_metrics <- wr_metrics[!is.na(wr_metrics$Tgt) & 
+                           !is.na(wr_metrics$Rec) &
+                           !is.na(wr_metrics$RecYds) &
+                           !is.na(wr_metrics$RECTD), ]
+  
+  return(wr_metrics)
+}
+
+# Apply the data preparation function
+wr_metrics <- prepare_wr_data(wr_data)
+
+# Check the structure of the prepared data
+head(wr_metrics)
+summary(wr_metrics)
+
+# Check overdispersion in count data
+count_cols <- c("Tgt", "Rec", "RecYds", "RECTD", "Rec1D", "RecBrkTkl")
+overdispersion <- data.frame(
+  metric = count_cols,
+  mean = sapply(count_cols, function(col) mean(wr_metrics[[col]], na.rm = TRUE)),
+  variance = sapply(count_cols, function(col) var(wr_metrics[[col]], na.rm = TRUE))
+)
+overdispersion$ratio <- overdispersion$variance / overdispersion$mean
+print("Overdispersion analysis (variance/mean):")
+print(overdispersion)
+
+# Check correlations between metrics
+metrics_cols <- c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", "Yard_Tgt", 
+                 "Rec1D", "AirYards", "AirY_Rec", "YAC", "YAC_R", 
+                 "AvgDepthTarget", "RecBrkTkl", "Drop_pct")
+cor_matrix <- cor(wr_metrics[, metrics_cols], use = "complete.obs")
+corrplot(cor_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.7,
+         title = "Correlation Matrix of WR Metrics")
+
+# Save the correlation matrix plot
+png("correlation_matrix.png", width = 1000, height = 800, res = 100)
+corrplot(cor_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.7,
+         title = "Correlation Matrix of WR Metrics")
+dev.off()
+
+# -----------------------------------------------
+# Prepare data for multiple distribution modeling
+# -----------------------------------------------
+
+# Extract the raw data matrix
+raw_cols <- c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", 
+             "Yard_Tgt", "Rec1D", "AirYards", "AirY_Rec", 
+             "YAC", "YAC_R", "AvgDepthTarget", 
+             "RecBrkTkl", "RecBrkTkl", "Drop_pct")
+
+X_wr <- as.matrix(wr_metrics[, raw_cols])
+colnames(X_wr) <- raw_cols
+
+# Handle any NA values by imputing with reasonable values
+X_wr[is.na(X_wr)] <- 0  # Replace NA with 0 for simplicity
+
+# Define indices for each distribution type based on statistical properties
+nb_indices <- c(1, 2, 7)  # Negative Binomial: Tgt, Rec, Rec1D (overdispersed counts)
+pois_indices <- c(4, 14)  # Poisson: RECTD, RecBrkTkl (regular counts)
+gamma_indices <- c(3, 8, 9, 10, 11, 12)  # Gamma: RecYds, AirYards, etc. (continuous positive)
+beta_indices <- c(5, 6, 15)  # Beta: Ctch_pct, Yard_Tgt, Drop_pct (proportions)
+norm_indices <- c(13)  # Normal: AvgDepthTarget (symmetric)
+
+# Prepare data matrices for each distribution type
+X_nb <- as.matrix(X_wr[, nb_indices, drop = FALSE])
+X_pois <- as.matrix(X_wr[, pois_indices, drop = FALSE])
+X_gamma <- as.matrix(X_wr[, gamma_indices, drop = FALSE])
+X_beta <- as.matrix(X_wr[, beta_indices, drop = FALSE])
+X_norm <- as.matrix(X_wr[, norm_indices, drop = FALSE])
+
+# Data preparation for each distribution type
+# Add small amount to gamma values to avoid zeros
+X_gamma <- X_gamma + 0.01
+
+# Squeeze beta values to be strictly between 0 and 1
+X_beta <- pmin(pmax(X_beta, 0.01), 0.99)
+
+# Count variables for model dimensions
+N_wr <- nrow(X_wr)    # Number of players
+nb_count <- ncol(X_nb)
+pois_count <- ncol(X_pois)
+gamma_count <- ncol(X_gamma)
+beta_count <- ncol(X_beta)
+norm_count <- ncol(X_norm)
+
+# Verify dimensions
+cat("Data dimensions:\n")
+cat("Number of players:", N_wr, "\n")
+cat("Negative Binomial metrics:", nb_count, "\n")
+cat("Poisson metrics:", pois_count, "\n")
+cat("Gamma metrics:", gamma_count, "\n")
+cat("Beta metrics:", beta_count, "\n")
+cat("Normal metrics:", norm_count, "\n")
+
+# -----------------------------------------------
+# Define the partial membership model with multiple distributions
+# -----------------------------------------------
+
+wr_pm_code <- nimbleCode({
+  # Priors for different types of distributions
+  for(k in 1:K) {
+    # Negative Binomial parameters (for overdispersed counts)
+    for(j in 1:nb_count) {
+      nb_size[k, j] ~ dgamma(2, 0.1)  # Size parameter (r) prior
+      nb_prob[k, j] ~ dbeta(2, 2)      # Probability parameter (p) prior
+    }
+    
+    # Poisson parameters (for regular counts)
+    for(j in 1:pois_count) {
+      lambda[k, j] ~ dgamma(1, 0.1)   # Rate parameter prior
+    }
+    
+    # Gamma parameters (for continuous, positive, right-skewed metrics)
+    for(j in 1:gamma_count) {
+      gamma_shape[k, j] ~ dgamma(2, 0.1)  # Shape parameter prior
+      gamma_rate[k, j] ~ dgamma(2, 0.1)   # Rate parameter prior
+    }
+    
+    # Beta parameters (for proportions)
+    for(j in 1:beta_count) {
+      beta_a[k, j] ~ dgamma(2, 0.1)  # Alpha parameter prior
+      beta_b[k, j] ~ dgamma(2, 0.1)  # Beta parameter prior
+    }
+    
+    # Normal parameters (for symmetric distributions)
+    for(j in 1:norm_count) {
+      norm_mean[k, j] ~ dnorm(0, 0.1)     # Mean parameter prior
+      norm_sd[k, j] ~ dunif(0.1, 10)      # Standard deviation prior
+    }
+  }
+  
+  # Prior for Dirichlet parameter for mixing weights
+  delta ~ dunif(0, 10)  # Following the paper's approach
+  
+  # Create fixed vector for Dirichlet distribution
+  for(k in 1:K) {
+    delta_vec[k] <- delta  # Create a vector of identical delta values
+  }
+  
+  # For each player
+  for(i in 1:N) {
+    # Membership weights follow Dirichlet distribution
+    alpha[i, 1:K] ~ ddirch(delta_vec[1:K])  
+    
+    # Now for each type of metric, calculate the expected parameters
+    # Then model the data according to those parameters
+    
+    # For Negative Binomial metrics (overdispersed counts)
+    for(j in 1:nb_count) {
+      # Calculate expected parameters for this player
+      # We need a small offset to avoid numerical issues with zero values
+      eps[i, j] <- 0.00001
+      
+      # Calculate weighted average of rate parameters
+      # Converting to log-space first for smoothness
+      log_size_ij[i, j] <- log(inprod(alpha[i, 1:K], nb_size[1:K, j]) + eps[i, j])
+      log_prob_ij[i, j] <- log(inprod(alpha[i, 1:K], nb_prob[1:K, j]) + eps[i, j])
+      
+      # Convert back to original parameterization
+      size_ij[i, j] <- exp(log_size_ij[i, j])
+      prob_ij[i, j] <- exp(log_prob_ij[i, j]) / (1 + exp(log_prob_ij[i, j])) # Bound to [0,1]
+      
+      # Data likelihood with offset to handle zeros
+      X_nb[i, j] ~ dnegbin(prob_ij[i, j], size_ij[i, j])
+    }
+    
+    # For Poisson metrics (regular counts)
+    for(j in 1:pois_count) {
+      # Calculate expected lambda for this player
+      lambda_ij[i, j] <- inprod(alpha[i, 1:K], lambda[1:K, j])
+      
+      # Data likelihood
+      X_pois[i, j] ~ dpois(lambda_ij[i, j])
+    }
+    
+    # For Gamma metrics (continuous positive)
+    for(j in 1:gamma_count) {
+      # Calculate expected parameters for this player
+      shape_ij[i, j] <- inprod(alpha[i, 1:K], gamma_shape[1:K, j])
+      rate_ij[i, j] <- inprod(alpha[i, 1:K], gamma_rate[1:K, j])
+      
+      # Data likelihood
+      X_gamma[i, j] ~ dgamma(shape_ij[i, j], rate_ij[i, j])
+    }
+    
+    # For Beta metrics (proportions)
+    for(j in 1:beta_count) {
+      # Calculate expected parameters for this player
+      a_ij[i, j] <- inprod(alpha[i, 1:K], beta_a[1:K, j])
+      b_ij[i, j] <- inprod(alpha[i, 1:K], beta_b[1:K, j])
+      
+      # Data likelihood
+      X_beta[i, j] ~ dbeta(a_ij[i, j], b_ij[i, j])
+    }
+    
+    # For Normal metrics (symmetric)
+    for(j in 1:norm_count) {
+      # Calculate expected parameters for this player
+      mean_ij[i, j] <- inprod(alpha[i, 1:K], norm_mean[1:K, j])
+      sd_ij[i, j] <- sqrt(inprod(alpha[i, 1:K], norm_sd[1:K, j]^2))
+      
+      # Data likelihood
+      X_norm[i, j] ~ dnorm(mean_ij[i, j], 1/sd_ij[i, j]^2)
+    }
+  }
+})
+
+# -----------------------------------------------
+# Run the MCMC for the partial membership model
+# -----------------------------------------------
+
+# Create a function to run MCMC for a specific K value
+run_mcmc_for_k <- function(K, n_wr, niter = 10000, nburnin = 2000, thin = 20) {
+  # Constants for the model
+  constants <- list(
+    N = n_wr,
+    K = K,
+    nb_count = nb_count,
+    pois_count = pois_count,
+    gamma_count = gamma_count,
+    beta_count = beta_count,
+    norm_count = norm_count
+  )
+  
+  # Data for the model
+  data <- list(
+    X_nb = X_nb,
+    X_pois = X_pois,
+    X_gamma = X_gamma,
+    X_beta = X_beta,
+    X_norm = X_norm
+  )
+  
+  # Initial values
+  inits <- list(
+    # Negative Binomial parameters
+    nb_size = matrix(rgamma(K*nb_count, 2, 0.1), K, nb_count),
+    nb_prob = matrix(rbeta(K*nb_count, 2, 2), K, nb_count),
+    
+    # Poisson parameters
+    lambda = matrix(rgamma(K*pois_count, 1, 0.1), K, pois_count),
+    
+    # Gamma parameters
+    gamma_shape = matrix(rgamma(K*gamma_count, 2, 0.1), K, gamma_count),
+    gamma_rate = matrix(rgamma(K*gamma_count, 2, 0.1), K, gamma_count),
+    
+    # Beta parameters
+    beta_a = matrix(rgamma(K*beta_count, 2, 0.1), K, beta_count),
+    beta_b = matrix(rgamma(K*beta_count, 2, 0.1), K, beta_count),
+    
+    # Normal parameters
+    norm_mean = matrix(rnorm(K*norm_count, 0, 0.1), K, norm_count),
+    norm_sd = matrix(runif(K*norm_count, 0.1, 10), K, norm_count),
+    
+    # Dirichlet parameters
+    alpha = matrix(rdirichlet(n_wr, rep(1, K)), n_wr, K),
+    delta = 1,
+    delta_vec = rep(1, K),
+    
+    # Other parameters needed
+    eps = matrix(0.00001, n_wr, nb_count)
+  )
+  
+  # Build and compile the model
+  wr_model <- nimbleModel(wr_pm_code, constants = constants, data = data, inits = inits)
+  compiled_model <- compileNimble(wr_model)
+  
+  # Set up MCMC configuration
+  mcmc_conf <- configureMCMC(wr_model, 
+                             monitors = c("alpha", "delta",
+                                         "nb_size", "nb_prob", "lambda", 
+                                         "gamma_shape", "gamma_rate", 
+                                         "beta_a", "beta_b", 
+                                         "norm_mean", "norm_sd"), 
+                             enableWAIC = TRUE)
+  mcmc <- buildMCMC(mcmc_conf)
+  compiled_mcmc <- compileNimble(mcmc, project = wr_model)
+  
+  # Run the MCMC
+  cat("Running model with K =", K, "\n")
+  samples <- runMCMC(compiled_mcmc, 
+                   niter = niter,      # Iterations
+                   nburnin = nburnin,  # Burn-in period
+                   thin = thin,        # Thinning interval
+                   summary = TRUE,
+                   WAIC = TRUE)        # Calculate WAIC for model comparison
+  
+  # Extract WAIC value
+  waic_value <- as.numeric(samples$WAIC$WAIC)
+  
+  # Store results
+  result <- list(
+    K = K,
+    WAIC = waic_value,
+    samples = samples
+  )
+  
+  cat("Completed. WAIC =", waic_value, "\n\n")
+  return(result)
+}
+
+# Run for different K values to find optimal number of clusters
+K_values <- 2:5
+waic_results_wr <- vector("list", length(K_values))
+
+# For interactive testing, only run K=3 
+# In production, run the full range of K values
+# For full results, uncomment this loop:
+
+# for(i in 1:length(K_values)) {
+#   K <- K_values[i]
+#   waic_results_wr[[i]] <- run_mcmc_for_k(K, N_wr)
+# }
+
+# For testing/development, we'll just run K=3 for now
+K_test <- 3
+waic_results_wr[[K_test-1]] <- run_mcmc_for_k(K_test, N_wr, niter = 5000, nburnin = 1000, thin = 10)
+
+# For testing, we'll assume K=3 is optimal based on WAIC
+# In production, determine this from the WAIC values:
+# waic_values_wr <- sapply(waic_results_wr, function(x) x$WAIC)
+# optimal_K_wr <- K_values[which.min(waic_values_wr)]
+# cat("Optimal number of clusters for WRs:", optimal_K_wr, "\n")
+
+# For stability in interpreting results, we'll use K=3
+K_wr <- 3
+
+# -----------------------------------------------
+# Process MCMC results and extract parameters
+# -----------------------------------------------
+
+# Extract the relevant samples from the MCMC output
+optimal_samples_wr <- waic_results_wr[[which(K_values == K_wr)]]$samples
+
+# Extract the alpha samples (membership weights)
+alpha_samples <- optimal_samples_wr$samples[, grep("alpha", colnames(optimal_samples_wr$samples))]
+
+# Calculate mean alphas (membership weights)
+alpha_means <- matrix(0, nrow = N_wr, ncol = K_wr)
+colnames(alpha_means) <- paste0("Cluster", 1:K_wr)
+rownames(alpha_means) <- wr_metrics$Player
+
+for(i in 1:N_wr) {
+  for(k in 1:K_wr) {
+    alpha_means[i, k] <- mean(alpha_samples[, paste0("alpha[", i, ", ", k, "]")])
+  }
+}
+
+# Extract parameter samples for different distributions
+# NB parameters for overdispersed counts
+nb_size_samples <- optimal_samples_wr$samples[, grep("nb_size", colnames(optimal_samples_wr$samples))]
+nb_prob_samples <- optimal_samples_wr$samples[, grep("nb_prob", colnames(optimal_samples_wr$samples))]
+
+# Poisson parameters for regular counts
+lambda_samples <- optimal_samples_wr$samples[, grep("lambda", colnames(optimal_samples_wr$samples))]
+
+# Gamma parameters for continuous positive metrics
+gamma_shape_samples <- optimal_samples_wr$samples[, grep("gamma_shape", colnames(optimal_samples_wr$samples))]
+gamma_rate_samples <- optimal_samples_wr$samples[, grep("gamma_rate", colnames(optimal_samples_wr$samples))]
+
+# Beta parameters for proportions
+beta_a_samples <- optimal_samples_wr$samples[, grep("beta_a", colnames(optimal_samples_wr$samples))]
+beta_b_samples <- optimal_samples_wr$samples[, grep("beta_b", colnames(optimal_samples_wr$samples))]
+
+# Normal parameters for symmetric metrics
+norm_mean_samples <- optimal_samples_wr$samples[, grep("norm_mean", colnames(optimal_samples_wr$samples))]
+norm_sd_samples <- optimal_samples_wr$samples[, grep("norm_sd", colnames(optimal_samples_wr$samples))]
+
+# Calculate mean parameters for each cluster
+# For all parameter types
+calculate_mean_params <- function(samples, K, count, pattern) {
+  means <- array(0, dim = c(K, count))
+  for(k in 1:K) {
+    for(j in 1:count) {
+      param_name <- paste0(pattern, "[", k, ", ", j, "]")
+      if(param_name %in% colnames(samples)) {
+        means[k, j] <- mean(samples[, param_name])
+      }
+    }
+  }
+  return(means)
+}
+
+# Calculate mean parameter values
+mean_nb_size <- calculate_mean_params(nb_size_samples, K_wr, nb_count, "nb_size")
+mean_nb_prob <- calculate_mean_params(nb_prob_samples, K_wr, nb_count, "nb_prob")
+mean_lambda <- calculate_mean_params(lambda_samples, K_wr, pois_count, "lambda")
+mean_gamma_shape <- calculate_mean_params(gamma_shape_samples, K_wr, gamma_count, "gamma_shape")
+mean_gamma_rate <- calculate_mean_params(gamma_rate_samples, K_wr, gamma_count, "gamma_rate")
+mean_beta_a <- calculate_mean_params(beta_a_samples, K_wr, beta_count, "beta_a")
+mean_beta_b <- calculate_mean_params(beta_b_samples, K_wr, beta_count, "beta_b")
+mean_norm_mean <- calculate_mean_params(norm_mean_samples, K_wr, norm_count, "norm_mean")
+mean_norm_sd <- calculate_mean_params(norm_sd_samples, K_wr, norm_count, "norm_sd")
+
+# Order clusters by size for consistency
+cluster_sizes <- colSums(alpha_means)
+print("Cluster sizes (sum of membership weights):")
+print(cluster_sizes)
+
+# Order indices
+order_idx <- order(cluster_sizes, decreasing = TRUE)
+
+# Reorder alpha
+mean_alpha_wr <- alpha_means[, order_idx]
+colnames(mean_alpha_wr) <- paste0("Cluster", 1:K_wr)
+
+# Function to reorder parameter matrices
+reorder_params <- function(param_matrix) {
+  return(param_matrix[order_idx, ])
+}
+
+# Reorder all parameter matrices
+mean_nb_size <- reorder_params(mean_nb_size)
+mean_nb_prob <- reorder_params(mean_nb_prob)
+mean_lambda <- reorder_params(mean_lambda)
+mean_gamma_shape <- reorder_params(mean_gamma_shape)
+mean_gamma_rate <- reorder_params(mean_gamma_rate)
+mean_beta_a <- reorder_params(mean_beta_a)
+mean_beta_b <- reorder_params(mean_beta_b)
+mean_norm_mean <- reorder_params(mean_norm_mean)
+mean_norm_sd <- reorder_params(mean_norm_sd)
+
+# -----------------------------------------------
+# Calculate expected values for visualization 
+# -----------------------------------------------
+
+# Create mapping back to original metrics
+nb_names <- colnames(X_nb)
+pois_names <- colnames(X_pois)
+gamma_names <- colnames(X_gamma)
+beta_names <- colnames(X_beta)
+norm_names <- colnames(X_norm)
+
+# Create a list of all metric names in order
+all_metric_names <- c(nb_names, pois_names, gamma_names, beta_names, norm_names)
+
+# If column names are missing, use the indices from each list
+if(any(is.null(all_metric_names))) {
+  all_metric_names <- c(
+    paste0("NB_", nb_indices),
+    paste0("Pois_", pois_indices),
+    paste0("Gamma_", gamma_indices),
+    paste0("Beta_", beta_indices),
+    paste0("Norm_", norm_indices)
+  )
+}
+
+# Initialize expected values matrix
+expected_values <- matrix(0, nrow = K_wr, ncol = length(all_metric_names))
+rownames(expected_values) <- paste0("Cluster", 1:K_wr)
+colnames(expected_values) <- all_metric_names
+
+# Calculate expected values for each distribution type
+# Negative Binomial: mean = r(1-p)/p
+for(k in 1:K_wr) {
+  # Negative Binomial
+  for(j in 1:nb_count) {
+    expected_values[k, j] <- mean_nb_size[k, j] * (1 - mean_nb_prob[k, j]) / mean_nb_prob[k, j]
+  }
+  
+  # Poisson
+  for(j in 1:pois_count) {
+    expected_values[k, j+nb_count] <- mean_lambda[k, j]
+  }
+  
+  # Gamma
+  for(j in 1:gamma_count) {
+    expected_values[k, j+nb_count+pois_count] <- mean_gamma_shape[k, j] / mean_gamma_rate[k, j]
+  }
+  
+  # Beta
+  for(j in 1:beta_count) {
+    expected_values[k, j+nb_count+pois_count+gamma_count] <- mean_beta_a[k, j] / (mean_beta_a[k, j] + mean_beta_b[k, j])
+  }
+  
+  # Normal
+  for(j in 1:norm_count) {
+    expected_values[k, j+nb_count+pois_count+gamma_count+beta_count] <- mean_norm_mean[k, j]
+  }
+}
+
+# This matrix now contains expected values for all metrics in their original scales
+mean_mu_wr <- expected_values
+
+# Define cluster names based on characteristics
+cluster_names <- c(
+  "Possession/Slot Receiver",
+  "Deep Threat/Big Play Receiver",
+  "Balanced/Do-it-all Receiver"
+)
+
+# Create a custom function for finding similar players
+calculate_similarity <- function(player1_name, player2_name, membership_data) {
+  # Get player 1 data
+  player1_idx <- which(membership_data$Player == player1_name)
+  if(length(player1_idx) == 0) return(NA)
+  player1_idx <- player1_idx[1]  # Use first occurrence if multiple
+  player1 <- membership_data[player1_idx, paste0("Cluster", 1:K_wr)]
+  
+  # Get player 2 data
+  player2_idx <- which(membership_data$Player == player2_name)
+  if(length(player2_idx) == 0) return(NA)
+  player2_idx <- player2_idx[1]  # Use first occurrence if multiple
+  player2 <- membership_data[player2_idx, paste0("Cluster", 1:K_wr)]
+  
+  # Calculate Euclidean distance in cluster space
+  dist <- sqrt(sum((as.numeric(player1) - as.numeric(player2))^2))
+  
+  # Convert to similarity (higher means more similar)
+  similarity <- 1 / (1 + dist)
+  
+  return(similarity)
+}
+
+# Find similar players to a given player
+find_similar_players <- function(target_player, all_players, n=5) {
+  all_similarities <- data.frame(
+    Player = character(0),
+    Similarity = numeric(0),
+    stringsAsFactors = FALSE
+  )
+  
+  for(p in unique(all_players$Player)) {
+    if(p != target_player) {
+      sim <- calculate_similarity(target_player, p, all_players)
+      if(!is.na(sim)) {
+        all_similarities <- rbind(all_similarities, 
+                                data.frame(Player = p, Similarity = sim, stringsAsFactors = FALSE))
+      }
+    }
+  }
+  
+  # Sort by similarity and return top n
+  all_similarities <- all_similarities[order(all_similarities$Similarity, decreasing = TRUE), ]
+  return(head(all_similarities, n))
+}
+
+# Visualization function for similarity
+visualize_similarity <- function(target_player, similar_players, all_data) {
+  # Get the target player's data
+  target_idx <- which(all_data$Player == target_player)[1]
+  target_data <- all_data[target_idx, c("Cluster1", "Cluster2", "Cluster3", "Player", "Team")]
+  
+  # Get data for similar players
+  similar_data <- data.frame()
+  for(i in 1:nrow(similar_players)) {
+    p <- similar_players$Player[i]
+    p_idx <- which(all_data$Player == p)[1]
+    if(!is.na(p_idx)) {
+      p_data <- all_data[p_idx, c("Cluster1", "Cluster2", "Cluster3", "Player", "Team")]
+      similar_data <- rbind(similar_data, p_data)
+    }
+  }
+  
+  # Add Type column to both data frames
+  target_data$Type <- "Target"
+  similar_data$Type <- "Similar"
+  
+  # Combine data
+  combined_data <- rbind(target_data, similar_data)
+  
+  # Create plot using ggplot2
+  p <- ggplot(combined_data, aes(x = Cluster1, y = Cluster2, size = Cluster3)) +
+    geom_point(aes(color = Type), alpha = 0.7) +
+    scale_color_manual(values = c("Target" = "red", "Similar" = "blue")) +
+    geom_text_repel(aes(label = Player), size = 3, max.overlaps = 10) +
+    theme_minimal() +
+    labs(title = paste("Players Similar to", target_player),
+         x = "Possession/Slot Ability", 
+         y = "Deep Threat Ability",
+         size = "Balanced Ability") +
+    theme(legend.position = "bottom")
+  
+  return(p)
+}
+
+# Get full player cluster membership data
+player_clusters <- data.frame(
+  Player = wr_metrics$Player,
+  Team = wr_metrics$Team,
+  Season = wr_metrics$Season
+)
+# Add membership columns
+for(k in 1:K_wr) {
+  player_clusters[[paste0("Cluster", k)]] <- mean_alpha_wr[, k]
+}
+# Add primary cluster
+player_clusters$PrimaryCluster <- apply(player_clusters[, paste0("Cluster", 1:K_wr)], 1, which.max)
+
+# Example: Find players similar to some star WRs
+example_players <- c("Tyreek Hill", "Justin Jefferson", "Cooper Kupp")
+similarity_results <- list()
+
+for(player in example_players) {
+  cat("\nPlayers similar to", player, ":\n")
+  similar <- find_similar_players(player, player_clusters, 5)
+  print(similar)
+  similarity_results[[player]] <- similar
+}
+
+# Create similarity plots for example players
+for(player in example_players) {
+  sim_plot <- visualize_similarity(player, similarity_results[[player]], player_clusters)
+  print(sim_plot)
+  ggsave(paste0("similarity_", gsub(" ", "_", player), ".png"), sim_plot, width = 8, height = 6)
+}
+
+# Define star WRs to exclude for hidden gems analysis
+star_wrs <- c(
+  "Tyreek Hill", "Justin Jefferson", "Davante Adams", "Cooper Kupp", 
+  "Stefon Diggs", "Ja'Marr Chase", "CeeDee Lamb", "Deebo Samuel",
+  "DK Metcalf", "Mike Evans", "DeVonta Smith", "A.J. Brown", 
+  "Keenan Allen", "Amon-Ra St. Brown", "Terry McLaurin", "Jaylen Waddle",
+  "Calvin Ridley", "Chris Godwin", "Tyler Lockett", "Michael Pittman Jr.",
+  "Garrett Wilson", "Drake London", "Brandon Aiyuk", "Tee Higgins"
+)
+
+# Filter out star WRs
+hidden_gems_candidates <- player_clusters[!player_clusters$Player %in% star_wrs, ]
+
+# Advanced: Find specialized "hidden gems" by profile type
+find_specialized_gems <- function(player_data, type = "possession", top_n = 10) {
+  # Define which clusters to emphasize based on type
+  if(type == "possession") {
+    # High Cluster1, lower others
+    player_data$score <- player_data$Cluster1 / (player_data$Cluster2 + 0.1)
+  } else if(type == "deep") {
+    # High Cluster2, lower others
+    player_data$score <- player_data$Cluster2 / (player_data$Cluster1 + 0.1)
+  } else if(type == "balanced") {
+    # High Cluster3
+    player_data$score <- player_data$Cluster3
+  } else if(type == "hybrid") {
+    # High in multiple dimensions
+    player_data$score <- player_data$Cluster1 * player_data$Cluster2 * 4
+  }
+  
+  # Sort by score and return top N
+  result <- player_data[order(player_data$score, decreasing = TRUE), ]
+  return(head(result, top_n))
+}
+```
+
+
+
+
+
+
+
+
+```{r}
+
+# -----------------------------------------------
+# WR Cluster Correlation Analysis
+# Standalone script for analyzing correlations within clusters
+# -----------------------------------------------
+
+# Load required packages
+library(ggplot2)
+library(corrplot)
+library(reshape2)
+library(viridis)
+library(gridExtra)
+library(RColorBrewer)
+
+# Read the wide receiver data
+wr_data <- read.csv("WR Stats all.csv", skip = 1) 
+
+# Rename the columns for better usability
+colnames(wr_data) <- c("Rank", "Player", "Tgt_raw", "Season", "Age", "Team", 
+                     "Games", "GS", "Tgt", "Rec", "RecYds", "Y_Rec", "RECTD", 
+                     "RecY_G", "Ctch_pct", "Yard_Tgt", "Rec1D", "RecSucc_pct", 
+                     "AirYards", "AirY_Rec", "YAC", "YAC_R", "AvgDepthTarget",
+                     "RecBrkTkl", "Rec_Br", "Drop", "Drop_pct", "Int", "PasserRating")
+
+# Function to prepare WR data
+prepare_wr_data <- function(data) {
+  wr_metrics <- data.frame(
+    Player = data$Player,
+    Team = data$Team,
+    Season = data$Season,
+    Tgt = as.numeric(as.character(data$Tgt)),               
+    Rec = as.numeric(as.character(data$Rec)),               
+    RecYds = as.numeric(as.character(data$RecYds)),         
+    RECTD = as.numeric(as.character(data$RECTD)),           
+    Ctch_pct = as.numeric(as.character(data$Ctch_pct)),     
+    Yard_Tgt = as.numeric(as.character(data$Yard_Tgt)),     
+    Rec1D = as.numeric(as.character(data$Rec1D)),           
+    RecSucc_pct = as.numeric(as.character(data$RecSucc_pct)), 
+    AirYards = as.numeric(as.character(data$AirYards)),     
+    AirY_Rec = as.numeric(as.character(data$AirY_Rec)),     
+    YAC = as.numeric(as.character(data$YAC)),               
+    YAC_R = as.numeric(as.character(data$YAC_R)),           
+    AvgDepthTarget = as.numeric(as.character(data$AvgDepthTarget)), 
+    RecBrkTkl = as.numeric(as.character(data$RecBrkTkl)),   
+    Drop_pct = as.numeric(as.character(data$Drop_pct))      
+  )
+  
+  # Filter out rows with missing values
+  wr_metrics <- wr_metrics[!is.na(wr_metrics$Tgt) & 
+                           !is.na(wr_metrics$Rec) &
+                           !is.na(wr_metrics$RecYds) &
+                           !is.na(wr_metrics$RECTD), ]
+  
+  return(wr_metrics)
+}
+
+# Prepare the data
+wr_metrics <- prepare_wr_data(wr_data)
+
+# Define metrics to analyze
+metrics_cols <- c("Tgt", "Rec", "RecYds", "RECTD", "Ctch_pct", "Yard_Tgt", 
+                 "Rec1D", "AirYards", "AirY_Rec", "YAC", "YAC_R", 
+                 "AvgDepthTarget", "RecBrkTkl", "Drop_pct")
+
+# SIMPLE CLUSTERING APPROACH for demonstration
+# Since we don't have the complex model results, we'll create clusters based on key metrics
+# This is a simplified approach to get the correlation analysis working
+
+# Create simple clusters based on key characteristics
+# We'll use k-means on standardized data
+set.seed(123)  # For reproducibility
+
+# Standardize the metrics
+wr_metrics_scaled <- scale(wr_metrics[, metrics_cols])
+
+# Perform k-means clustering with k=3
+kmeans_result <- kmeans(wr_metrics_scaled, centers = 3, nstart = 25)
+
+# Create cluster assignments
+wr_metrics$Cluster <- kmeans_result$cluster
+
+# Define cluster names based on characteristics
+cluster_centers <- kmeans_result$centers
+cluster_names <- c("Possession/Slot Receiver", "Deep Threat Receiver", "Balanced Receiver")
+
+# Look at cluster centers to assign meaningful names
+print("Cluster Centers (standardized):")
+print(cluster_centers)
+
+# Assign names based on patterns (you can adjust these based on your data)
+# Usually cluster 1 = high volume/possession, cluster 2 = deep threat, cluster 3 = balanced
+names(cluster_names) <- 1:3
+
+# Print cluster sizes
+table(wr_metrics$Cluster)
+
+# -----------------------------------------------
+# CORRELATION ANALYSIS BY CLUSTER
+# -----------------------------------------------
+
+# Function to calculate and visualize correlations for each cluster
+analyze_cluster_correlations <- function(data, cluster_col = "Cluster", metrics = metrics_cols) {
+  
+  # Storage for results
+  correlation_results <- list()
+  correlation_matrices <- list()
+  
+  # Get unique clusters
+  clusters <- sort(unique(data[[cluster_col]]))
+  
+  cat("=== CLUSTER CORRELATION ANALYSIS ===\n\n")
+  
+  for(i in clusters) {
+    cluster_name <- cluster_names[as.character(i)]
+    cat("Analyzing Cluster", i, ":", cluster_name, "\n")
+    
+    # Get players in this cluster
+    cluster_players <- data[data[[cluster_col]] == i, ]
+    
+    if(nrow(cluster_players) < 10) {
+      cat("  Skipping - too few players (", nrow(cluster_players), ")\n\n")
+      next
+    }
+    
+    cat("  Players in cluster:", nrow(cluster_players), "\n")
+    
+    # Calculate correlation matrix for this cluster
+    cluster_metrics <- cluster_players[, metrics]
+    corr_matrix <- cor(cluster_metrics, use = "pairwise.complete.obs")
+    
+    # Store the correlation matrix
+    correlation_matrices[[paste0("Cluster_", i)]] <- corr_matrix
+    
+    # Create correlation plot
+    png(paste0("cluster_", i, "_correlations.png"), width = 1000, height = 800, res = 100)
+    corrplot(corr_matrix, method = "circle", type = "upper", 
+             tl.col = "black", tl.srt = 45, tl.cex = 0.8,
+             title = paste("Correlations in", cluster_name),
+             mar = c(0,0,2,0))
+    dev.off()
+    
+    # Find strongest correlations
+    corr_df <- reshape2::melt(corr_matrix)
+    names(corr_df) <- c("Metric1", "Metric2", "Correlation")
+    
+    # Remove self-correlations and duplicates
+    corr_df <- corr_df[corr_df$Metric1 != corr_df$Metric2, ]
+    corr_df <- corr_df[!duplicated(t(apply(corr_df[, 1:2], 1, sort))), ]
+    
+    # Sort by absolute correlation strength
+    corr_df <- corr_df[order(abs(corr_df$Correlation), decreasing = TRUE), ]
+    
+    cat("  Top 5 strongest correlations:\n")
+    print(head(corr_df, 5))
+    
+    cat("  Top 5 positive correlations:\n")
+    positive_corr <- corr_df[corr_df$Correlation > 0, ]
+    print(head(positive_corr, 5))
+    
+    cat("  Top 5 negative correlations:\n")
+    negative_corr <- corr_df[corr_df$Correlation < 0, ]
+    print(head(negative_corr, 5))
+    
+    # Store results
+    correlation_results[[paste0("Cluster_", i)]] <- list(
+      cluster_name = cluster_name,
+      correlation_matrix = corr_matrix,
+      top_correlations = head(corr_df, 10),
+      n_players = nrow(cluster_players)
+    )
+    
+    cat("\n")
+  }
+  
+  return(list(results = correlation_results, matrices = correlation_matrices))
+}
+
+# Run the correlation analysis
+correlation_analysis <- analyze_cluster_correlations(wr_metrics)
+
+# -----------------------------------------------
+# COMPARE CORRELATIONS BETWEEN CLUSTERS
+# -----------------------------------------------
+
+# Function to compare correlations between clusters
+compare_cluster_correlations <- function(correlation_matrices) {
+  
+  clusters <- names(correlation_matrices)
+  n_clusters <- length(clusters)
+  
+  cat("=== COMPARING CORRELATIONS BETWEEN CLUSTERS ===\n\n")
+  
+  # For each pair of clusters, compare their correlation matrices
+  for(i in 1:(n_clusters-1)) {
+    for(j in (i+1):n_clusters) {
+      cluster1 <- clusters[i]
+      cluster2 <- clusters[j]
+      
+      cat("Comparing", cluster1, "vs", cluster2, ":\n")
+      
+      # Calculate difference in correlation matrices
+      corr_diff <- correlation_matrices[[cluster1]] - correlation_matrices[[cluster2]]
+      
+      # Find the biggest differences
+      diff_df <- reshape2::melt(corr_diff)
+      names(diff_df) <- c("Metric1", "Metric2", "Difference")
+      
+      # Remove self-correlations and duplicates
+      diff_df <- diff_df[diff_df$Metric1 != diff_df$Metric2, ]
+      diff_df <- diff_df[!duplicated(t(apply(diff_df[, 1:2], 1, sort))), ]
+      
+      # Sort by absolute difference
+      diff_df <- diff_df[order(abs(diff_df$Difference), decreasing = TRUE), ]
+      
+      cat("  Biggest correlation differences:\n")
+      print(head(diff_df, 5))
+      
+      # Create visualization of differences
+      png(paste0("correlation_diff_", gsub("Cluster_", "", cluster1), "_vs_", gsub("Cluster_", "", cluster2), ".png"), 
+          width = 1000, height = 800, res = 100)
+      corrplot(corr_diff, method = "circle", type = "upper", 
+               tl.col = "black", tl.srt = 45, tl.cex = 0.8,
+               title = paste("Correlation Differences:", gsub("Cluster_", "Cluster ", cluster1), "minus", gsub("Cluster_", "Cluster ", cluster2)),
+               mar = c(0,0,2,0))
+      dev.off()
+      
+      cat("\n")
+    }
+  }
+}
+
+# Compare correlations between clusters
+compare_cluster_correlations(correlation_analysis$matrices)
+
+# -----------------------------------------------
+# COMBINED VISUALIZATION: MEANS AND CORRELATIONS
+# -----------------------------------------------
+
+# Function to create combined mean and correlation visualization
+create_combined_visualization <- function(data, correlation_matrices, cluster_col = "Cluster") {
+  
+  # Calculate means by cluster
+  cluster_means <- aggregate(data[, metrics_cols], 
+                           by = list(Cluster = data[[cluster_col]]), 
+                           FUN = mean, na.rm = TRUE)
+  
+  # Reshape for plotting
+  means_long <- reshape2::melt(cluster_means, id.vars = "Cluster")
+  names(means_long) <- c("Cluster", "Metric", "Mean_Value")
+  
+  # Add cluster names
+  means_long$Cluster_Name <- cluster_names[as.character(means_long$Cluster)]
+  
+  # Plot means
+  p1 <- ggplot(means_long, aes(x = Metric, y = Mean_Value, color = Cluster_Name, group = Cluster_Name)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5, face = "bold")) +
+    labs(title = "Cluster Profiles: Mean Values by Metric",
+         x = "Metrics", y = "Mean Value", color = "Cluster") +
+    scale_color_viridis_d()
+  
+  print(p1)
+  ggsave("cluster_means_profile.png", p1, width = 12, height = 6)
+  
+  # Create correlation heatmap for each cluster
+  plots <- list()
+  
+  for(i in 1:length(correlation_matrices)) {
+    cluster_name <- names(correlation_matrices)[i]
+    corr_matrix <- correlation_matrices[[i]]
+    
+    # Convert correlation matrix to long format
+    corr_long <- reshape2::melt(corr_matrix)
+    names(corr_long) <- c("Metric1", "Metric2", "Correlation")
+    
+    # Create heatmap
+    p <- ggplot(corr_long, aes(x = Metric1, y = Metric2, fill = Correlation)) +
+      geom_tile() +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                          midpoint = 0, limits = c(-1, 1)) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 8),
+            plot.title = element_text(hjust = 0.5, size = 10)) +
+      labs(title = paste("Correlations:", gsub("Cluster_", "Cluster ", cluster_name)),
+           x = "", y = "") +
+      coord_fixed()
+    
+    plots[[i]] <- p
+  }
+  
+  # Combine all correlation heatmaps
+  if(length(plots) > 0) {
+    combined_plot <- do.call(grid.arrange, c(plots, ncol = length(plots)))
+    ggsave("all_cluster_correlations.png", combined_plot, width = 15, height = 5)
+  }
+  
+  return(list(means_plot = p1, correlation_plots = plots))
+}
+
+# Create combined visualization
+combined_viz <- create_combined_visualization(wr_metrics, correlation_analysis$matrices)
+
+# -----------------------------------------------
+# SUMMARY REPORT
+# -----------------------------------------------
+
+cat("\n=== SUMMARY REPORT ===\n")
+cat("Cluster Correlation Analysis Complete!\n\n")
+
+for(i in 1:3) {
+  cluster_name <- cluster_names[as.character(i)]
+  n_players <- sum(wr_metrics$Cluster == i)
+  
+  cat("CLUSTER", i, ":", cluster_name, "\n")
+  cat("  Number of players:", n_players, "\n")
+  
+  if(paste0("Cluster_", i) %in% names(correlation_analysis$results)) {
+    top_corr <- correlation_analysis$results[[paste0("Cluster_", i)]]$top_correlations[1, ]
+    cat("  Strongest correlation:", as.character(top_corr$Metric1), "with", as.character(top_corr$Metric2), 
+        "(r =", round(top_corr$Correlation, 3), ")\n")
+  }
+  cat("\n")
+}
+
+cat("Files generated:\n")
+cat("- cluster_X_correlations.png: Correlation matrices for each cluster\n")
+cat("- correlation_diff_X_vs_Y.png: Differences between cluster correlations\n")
+cat("- cluster_means_profile.png: Mean values across clusters\n")
+cat("- all_cluster_correlations.png: Combined correlation heatmaps\n")
+
+# Export correlation matrices to CSV
+for(i in names(correlation_analysis$matrices)) {
+  write.csv(correlation_analysis$matrices[[i]], paste0(i, "_correlation_matrix.csv"))
+}
+
+cat("\nCorrelation matrices exported as CSV files for further analysis.\n")
+
+
+
+```
+
+
